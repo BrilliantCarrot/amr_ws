@@ -1,0 +1,17 @@
+# ROS2 / Colcon 관련
+build/
+install/
+log/
+
+# Python 관련
+__pycache__/
+*.pyc
+
+# C++ / C# 관련
+bin/
+obj/
+*.exe
+
+# OS 관련
+.DS_Store
+Thumbs.db
