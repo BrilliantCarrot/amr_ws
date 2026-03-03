@@ -2,6 +2,7 @@
 build/
 install/
 log/
+bags/
 
 # Python 관련
 __pycache__/
