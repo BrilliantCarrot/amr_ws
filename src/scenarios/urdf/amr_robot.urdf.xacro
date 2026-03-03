@@ -1,0 +1,179 @@
+<?xml version="1.0"?>
+<robot name="amr_robot" xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+  <!-- ===== 로봇 기본 파라미터 ===== -->
+  <!-- 로봇의 크기, 바퀴, 반지름 등을 선언 -->
+  <xacro:property name="base_width"   value="0.4"/>
+  <xacro:property name="base_length"  value="0.5"/>
+  <xacro:property name="base_height"  value="0.15"/>
+  <xacro:property name="wheel_radius" value="0.1"/>
+  <xacro:property name="wheel_width"  value="0.05"/>
+  
+
+  <!-- ===== 바퀴 매크로 (4번 재사용) ===== -->
+  <xacro:macro name="wheel" params="name x_pos y_pos">
+    <link name="${name}">
+      <visual>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/>
+        </geometry>
+        <material name="gray">
+          <color rgba="0.4 0.4 0.4 1.0"/>
+        </material>
+      </visual>
+        <!-- 물리 엔진에서 충돌을 감지하는 영역 (collision) -->
+      <collision>
+      <!-- 충돌 계산 범위 -->
+        <geometry>
+        <!-- 외형과 동일한 크기의 원기둥 -->
+          <cylinder radius="${wheel_radius}" length="${wheel_width}"/> 
+        </geometry>
+      </collision>
+      <inertial>
+      <!-- 물리적 무게중심 및 관성 -->
+        <mass value="1.0"/><!-- 바퀴 하나의 질량: 1kg -->
+        <!-- 관성 모멘트 텐서 (회전에 저항하는 성질) -->
+        <inertia ixx="0.01" ixy="0.0" ixz="0.0"
+                 iyy="0.01" iyz="0.0" izz="0.01"/>
+      </inertial>
+    </link>
+     <!-- 바퀴와 몸체를 연결하는 관절 (joint) 정의 -->
+    <joint name="${name}_joint" type="continuous"><!-- continuous: 무한 회전 가능한 관절 -->
+      <parent link="base_link"/> <!--관절의 기준이 되는 부모 링크(로봇 몸체)-->
+      <child  link="${name}"/> <!--부모에 의해 움직임이 결정되는 자식 링크(바퀴)-->
+      <!-- 부모 링크 기준 관절이 생성되는 위치 및 회전 자세 -->
+      <origin xyz="${x_pos} ${y_pos} ${-base_height/2}"
+              rpy="${pi/2} 0 0"/> <!--위치 및 자세 설정, 부모 링크의 중심을 기준으로 바퀴가 붙을 좌표-->
+                  <!-- 
+                    xyz: x, y 위치는 매크로 인자로 받고, z 높이는 몸체 바닥면에 맞춤 (-base_height/2)
+                    rpy: Roll(x축 회전)을 90도(pi/2) 꺾어 원기둥을 세우지 않고 눕혀 굴러가게 함.
+                    -->
+              <!---base_height/2: 몸체 박스의 바닥면 높이에 바퀴 중심을 맞추기 위함-->
+      <axis xyz="0 0 1"/> <!-- 관절이 회전하는 축 (z축 방향 회전) -->
+    </joint>
+  </xacro:macro>
+
+  <!-- ===== base_link : 로봇 몸체 ===== -->
+  <link name="base_link">
+    <visual>
+      <geometry>
+        <box size="${base_length} ${base_width} ${base_height}"/>
+      </geometry>
+      <material name="blue">
+        <color rgba="0.0 0.0 0.8 1.0"/>
+      </material>
+    </visual>
+    <collision>
+      <geometry>
+        <box size="${base_length} ${base_width} ${base_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <mass value="15.0"/>
+      <inertia ixx="0.2" ixy="0.0" ixz="0.0"
+               iyy="0.2" iyz="0.0" izz="0.2"/>
+    </inertial>
+  </link>
+
+  <!-- ===== imu_link : IMU 센서 ===== -->
+  <link name="imu_link">
+    <visual>
+      <geometry><box size="0.05 0.05 0.02"/></geometry>
+      <material name="red"><color rgba="0.8 0.0 0.0 1.0"/></material>
+    </visual>
+  </link>
+  <joint name="imu_joint" type="fixed"><!-- fixed: 움직이지 않고 단단히 고정된 관절 -->
+    <parent link="base_link"/>
+    <child  link="imu_link"/>
+    <!-- 몸체 중앙의 위쪽 표면 부근에 부착 (z=0.075) -->
+    <origin xyz="0.0 0.0 0.075" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ===== laser_link : 2D LiDAR ===== -->
+  <link name="laser_link">
+    <visual>
+      <geometry><cylinder radius="0.05" length="0.04"/></geometry>
+      <material name="black"><color rgba="0.1 0.1 0.1 1.0"/></material>
+    </visual>
+  </link>
+  <joint name="laser_joint" type="fixed">
+    <parent link="base_link"/>
+    <child  link="laser_link"/>
+    <!-- 몸체의 앞쪽(x=0.2), 중심(y=0.0), 위쪽(z=0.1)에 부착하여 전방 시야 확보 -->
+    <origin xyz="0.2 0.0 0.1" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ===== 바퀴 4개 (앞왼, 앞오, 뒤왼, 뒤오) ===== -->
+  <xacro:wheel name="front_left_wheel"
+    x_pos=" ${base_length/4}"
+    y_pos=" ${base_width/2 + wheel_width/2}"/>
+
+  <xacro:wheel name="front_right_wheel"
+    x_pos=" ${base_length/4}"
+    y_pos="${-(base_width/2 + wheel_width/2)}"/>
+
+  <xacro:wheel name="rear_left_wheel"
+    x_pos="${-base_length/4}"
+    y_pos=" ${base_width/2 + wheel_width/2}"/>
+
+  <xacro:wheel name="rear_right_wheel"
+    x_pos="${-base_length/4}"
+    y_pos="${-(base_width/2 + wheel_width/2)}"/>
+
+<!-- ===== Gazebo 플러그인 ===== -->
+
+  <!-- Skid-Steer 구동 플러그인 -->
+  <gazebo>
+    <plugin filename="libignition-gazebo-diff-drive-system.so"
+            name="ignition::gazebo::systems::DiffDrive">
+      <left_joint>front_right_wheel_joint</left_joint>
+      <left_joint>rear_right_wheel_joint</left_joint>
+      <right_joint>front_left_wheel_joint</right_joint>
+      <right_joint>rear_left_wheel_joint</right_joint>
+      <wheel_separation>0.45</wheel_separation>
+      <wheel_radius>0.1</wheel_radius>
+      <topic>/cmd_vel</topic>
+      <odom_topic>/odom</odom_topic>
+      <frame_id>odom</frame_id>
+      <child_frame_id>base_link</child_frame_id>
+      <odom_publish_frequency>50</odom_publish_frequency>
+    </plugin>
+  </gazebo>
+
+  <!-- IMU 센서 플러그인 -->
+  <gazebo reference="imu_link">
+    <sensor name="imu_sensor" type="imu">
+      <always_on>true</always_on>
+      <update_rate>100</update_rate>
+      <topic>/imu</topic>
+      <ignition_frame_id>imu_link</ignition_frame_id>
+      <plugin filename="libignition-gazebo-imu-system.so"
+        name="ignition::gazebo::systems::Imu"/>  <!-- 추가 -->
+    </sensor>
+  </gazebo>
+
+  <!-- 2D LiDAR 센서 플러그인 -->
+  <gazebo reference="laser_link">
+    <sensor name="lidar" type="gpu_lidar">
+      <always_on>true</always_on>
+      <update_rate>10</update_rate>
+      <topic>/scan</topic>
+      <ignition_frame_id>laser_link</ignition_frame_id>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>360</samples>
+            <resolution>1</resolution>
+            <min_angle>-3.14159</min_angle>
+            <max_angle>3.14159</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.1</min>
+          <max>10.0</max>
+        </range>
+      </ray>
+    </sensor>
+  </gazebo>
+
+</robot>

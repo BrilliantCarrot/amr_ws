@@ -13,7 +13,7 @@ def launch_setup(context, *args, **kwargs):
     # rosbag 저장 경로: bags/실험이름_날짜시간
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     bag_path = os.path.expanduser(
-        f'~/master/amr_ws/bags/{exp_name}_{timestamp}'
+        f'~/amr_ws/bags/{exp_name}_{timestamp}'
     )
 
     # 메트릭 토픽 3개 자동 record
