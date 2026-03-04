@@ -123,6 +123,7 @@
 <!-- ===== Gazebo 플러그인 ===== -->
 
   <!-- Skid-Steer 구동 플러그인 -->
+  <!-- 바퀴에 토크 적용, 실제 회전 + /odom 퍼블리시-->
   <gazebo>
     <plugin filename="libignition-gazebo-diff-drive-system.so"
             name="ignition::gazebo::systems::DiffDrive">
@@ -141,6 +142,8 @@
   </gazebo>
 
   <!-- IMU 센서 플러그인 -->
+  <!-- 시뮬레이션 물리 엔진의 가속도/각속도 읽기-->
+  <!-- /imu 토픽으로 퍼블리시(100hz)-->
   <gazebo reference="imu_link">
     <sensor name="imu_sensor" type="imu">
       <always_on>true</always_on>
@@ -153,6 +156,8 @@
   </gazebo>
 
   <!-- 2D LiDAR 센서 플러그인 -->
+  <!-- 레이캐스팅으로 주변 장애물 거리 계산-->
+  <!-- /scan 토픽으로 퍼블리시(10hz)-->
   <gazebo reference="laser_link">
     <sensor name="lidar" type="gpu_lidar">
       <always_on>true</always_on>

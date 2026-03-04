@@ -1,24 +1,54 @@
 <?xml version="1.0"?>
 <sdf version="1.8">
+  <!-- world: 시뮬레이션 전체 환경의 최상위 컨테이너
+       name 속성은 ROS2 launch 파일에서 world 인자로 참조됨 -->
   <world name="simple_room">
 
-    <!-- 물리 엔진 설정 -->
+    <!-- ══════════════════════════════════════════════
+         물리 엔진 설정
+         ODE(Open Dynamics Engine): Gazebo 기본 물리 엔진
+         ══════════════════════════════════════════════ -->
     <physics name="default_physics" type="ode">
+      <!-- 시뮬레이션 시간 스텝 [단위: 초]
+           0.001 = 1ms → 1kHz 제어 루프와 동기화 가능
+           작을수록 정확하지만 CPU 부하 증가
+           일반적으로 제어 주기의 1/10 이하로 설정 권장 -->    
       <max_step_size>0.001</max_step_size>
+      <!-- 실시간 배율
+           1.0  = 실제 시간과 동일한 속도로 시뮬레이션
+           0.5  = 실제 시간의 절반 속도 (느리게, 더 정확)
+           2.0  = 실제 시간의 2배 속도 (빠르게, 부하 있음)
+           MPC/EKF 타임스탬프 기반 알고리즘은 1.0 권장 -->
       <real_time_factor>1.0</real_time_factor>
     </physics>
 
     <!-- 기본 플러그인 -->
+    <!-- ══════════════════════════════════════════════
+         시스템 플러그인 (Ignition Gazebo 기능 모듈)
+         각 플러그인은 독립적인 시스템으로 동작하며
+         필요한 기능만 선택적으로 활성화할 수 있음
+         ══════════════════════════════════════════════ -->
+    <!-- 물리 연산 시스템: 강체 동역학, 충돌 감지, 마찰력 계산 담당
+         이 플러그인 없으면 물체가 공중에 떠 있게 됨 -->
     <plugin filename="libignition-gazebo-physics-system.so"
             name="ignition::gazebo::systems::Physics"/>
+    <!-- 센서 시스템: LiDAR, 카메라, IMU 등 센서 데이터 생성 담당
+         render_engine: ogre2 = Ignition 기본 렌더러 (카메라/깊이 센서 필수) -->
     <plugin filename="libignition-gazebo-sensors-system.so"
             name="ignition::gazebo::systems::Sensors">
       <render_engine>ogre2</render_engine>
     </plugin>
+    <!-- 씬 브로드캐스터: Gazebo GUI(rviz 아님)로 3D 장면 데이터 전송 담당
+         이 플러그인 없으면 Gazebo 창에 아무것도 안 보임 -->
     <plugin filename="libignition-gazebo-scene-broadcaster-system.so"
             name="ignition::gazebo::systems::SceneBroadcaster"/>
+    <!-- 유저 커맨드 시스템: GUI에서 마우스로 물체 이동/회전/삭제 가능하게 함
+         디버깅 시 장애물 위치 실시간 변경할 때 유용 -->
     <plugin filename="libignition-gazebo-user-commands-system.so"
             name="ignition::gazebo::systems::UserCommands"/>
+    <!-- IMU 시스템: IMU 센서 플러그인이 동작하려면 반드시 필요
+         로봇 모델의 <sensor type="imu"> 태그와 연동됨
+         이게 없으면 IMU 토픽이 퍼블리시되지 않음 -->
     <plugin filename="libignition-gazebo-imu-system.so"
             name="ignition::gazebo::systems::Imu"/>
 
@@ -33,17 +63,25 @@
 
     <!-- 바닥 -->
     <model name="ground_plane">
+      <!-- static=true: 물리 엔진이 이 모델의 동역학을 계산하지 않음
+           벽, 바닥, 고정 장애물에 반드시 설정해야 성능 절약됨 -->
       <static>true</static>
+      <!-- link: 물리적으로 하나의 강체(rigid body) 단위
+                 하나의 model에 여러 link가 있을 수 있음 (관절로 연결) -->
       <link name="link">
         <collision name="collision">
+            <!-- plane: 무한히 넓은 평면 (바닥에 최적)
+                 normal: 법선 벡터 0 0 1 = Z축 방향 → 수평 바닥 -->
           <geometry><plane><normal>0 0 1</normal></plane></geometry>
         </collision>
+        <!-- visual: 렌더링(화면 표시)에 사용되는 형상
+             collision과 다르게 size를 지정해서 유한한 크기로 보이게 함 -->
         <visual name="visual">
           <geometry><plane>
             <normal>0 0 1</normal>
-            <size>20 20</size>
+            <size>20 20</size> <!--20m x 20m 바닥 표시-->
           </plane></geometry>
-          <material>
+          <material> <!--빛 반사-->
             <ambient>0.8 0.8 0.8 1</ambient>
             <diffuse>0.8 0.8 0.8 1</diffuse>
           </material>
