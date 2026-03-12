@@ -1,0 +1,174 @@
+#ifndef ESTIMATION__EKF_CORE_HPP_
+#define ESTIMATION__EKF_CORE_HPP_
+
+#include <Eigen/Dense>
+
+namespace estimation
+{
+
+// ============================================================
+// EKF (Extended Kalman Filter) 핵심 연산 클래스
+//
+// [EKF가 뭔가?]
+//   칼만 필터(KF)는 선형 시스템에서 최적의 상태 추정을 하는 알고리즘임.
+//   근데 실제 로봇의 운동 방정식은 비선형 (sin, cos 포함)이라서
+//   KF를 그대로 쓸 수 없음.
+//   EKF는 비선형 함수를 현재 상태 주변에서 1차 테일러 전개로 선형화해서
+//   KF를 적용하는 방식임.
+//
+// [이 클래스의 역할]
+//   ROS2 의존성 없이 순수하게 수식만 담당함.
+//   덕분에 ROS 없이도 단독으로 단위 테스트 가능.
+// ============================================================
+
+// --- 상태/입력/관측 차원 상수 ---
+// constexpr: 컴파일 타임 상수 → 매직 넘버 대신 이름으로 관리
+constexpr int STATE_DIM = 6;  // 상태 벡터 차원: [x, y, θ, vx, vy, ω]
+constexpr int INPUT_DIM = 3;  // IMU 입력 차원: [ax, ay, ω_imu]
+constexpr int OBS_DIM   = 3;  // Odom 관측 차원: [vx, vy, ω_odom]
+
+// --- Eigen 타입 별칭 ---
+// 코드 가독성을 위해 긴 Eigen 타입을 짧게 alias 처리함
+using StateVec  = Eigen::Matrix<double, STATE_DIM, 1>;              // 6×1 상태 벡터
+using StateMat  = Eigen::Matrix<double, STATE_DIM, STATE_DIM>;      // 6×6 행렬
+using ObsVec    = Eigen::Matrix<double, OBS_DIM, 1>;                // 3×1 관측 벡터
+using ObsMat    = Eigen::Matrix<double, OBS_DIM, STATE_DIM>;        // 3×6 관측 행렬
+using KalmanMat = Eigen::Matrix<double, STATE_DIM, OBS_DIM>;        // 6×3 칼만 게인 행렬
+
+class EkfCore
+{
+public:
+  EkfCore();
+
+  // --------------------------------------------------------
+  // 초기화
+  //   x0 : 초기 상태 벡터 (보통 영벡터로 시작)
+  //   P0 : 초기 공분산 행렬
+  //        → 대각 성분이 클수록 "나는 초기값을 잘 모른다"는 의미
+  //        → 이후 데이터가 쌓이면 P가 수렴하면서 추정 신뢰도 올라감
+  // --------------------------------------------------------
+  void init(const StateVec & x0, const StateMat & P0);
+
+  // --------------------------------------------------------
+  // Predict 단계 (IMU → 200Hz마다 호출)
+  //
+  //   IMU의 가속도(ax, ay)와 각속도(omega_imu)를 입력으로 받아
+  //   운동 방정식 f(x, u)로 다음 상태를 예측함.
+  //
+  //   수식:
+  //     x_pred = f(x, u)           ← 비선형 상태 전이
+  //     P_pred = F·P·Fᵀ + Q        ← 공분산 전파
+  //       F: 상태 전이 함수의 야코비안 (선형화 행렬)
+  //       Q: 프로세스 노이즈 (IMU 적분 오차, 모델링 오차 등)
+  //
+  //   [왜 IMU로 예측하나?]
+  //     IMU는 200Hz로 빠르게 들어와서 짧은 dt 동안의 운동을
+  //     적분해 위치/속도를 갱신하기에 적합함.
+  //     단, 적분 오차가 누적되므로 반드시 Odom으로 보정해야 함.
+  //
+  //   ax        : body frame x축 선가속도 [m/s²]
+  //   ay        : body frame y축 선가속도 [m/s²]
+  //   omega_imu : IMU 측정 각속도 [rad/s]
+  //   dt        : 이전 predict 이후 경과 시간 [s]
+  // --------------------------------------------------------
+  void predict(double ax, double ay, double omega_imu, double dt);
+
+  // --------------------------------------------------------
+  // Update 단계 (Odom → 50Hz마다 호출)
+  //
+  //   Odom의 속도(vx, vy, ω)를 관측값으로 받아 예측값을 보정함.
+  //
+  //   수식:
+  //     y = z - H·x_pred           ← innovation (잔차): 실제 관측과 예측의 차이
+  //     S = H·P·Hᵀ + R             ← innovation 공분산
+  //     K = P·Hᵀ·S⁻¹               ← 칼만 게인: 얼마나 관측을 믿을지 결정
+  //     x = x_pred + K·y           ← 상태 보정
+  //     P = (I - K·H)·P_pred       ← 공분산 갱신
+  //
+  //   [칼만 게인 K의 의미]
+  //     K가 크면 → 관측(Odom)을 더 믿음 (R이 작을 때)
+  //     K가 작으면 → 예측(IMU 모델)을 더 믿음 (Q가 작을 때)
+  //     즉, K는 센서 노이즈와 모델 불확실성의 균형을 자동으로 맞춰줌.
+  //
+  //   vx_odom    : Odom 선속도 x [m/s]
+  //   vy_odom    : Odom 선속도 y [m/s] (Diff-Drive에서는 보통 0)
+  //   omega_odom : Odom 각속도 [rad/s]
+  // --------------------------------------------------------
+  void update(double vx_odom, double vy_odom, double omega_odom);
+
+  // --------------------------------------------------------
+  // 파라미터 설정
+  //
+  //   Q (프로세스 노이즈 공분산):
+  //     모델이 현실을 얼마나 못 따라가는지를 나타냄.
+  //     Q가 크면 → 모델을 불신 → 관측을 더 따라감 (반응성 ↑, 노이즈 민감)
+  //     Q가 작으면 → 모델을 신뢰 → 예측 위주로 감 (안정적, 반응성 ↓)
+  //
+  //   R (관측 노이즈 공분산):
+  //     센서(Odom)의 측정 노이즈 수준을 나타냄.
+  //     R이 크면 → 센서를 불신 → 예측 위주로 감
+  //     R이 작으면 → 센서를 신뢰 → 관측을 더 따라감
+  // --------------------------------------------------------
+  void setProcessNoise(const StateMat & Q);
+  void setMeasurementNoise(const Eigen::Matrix<double, OBS_DIM, OBS_DIM> & R);
+
+  // --- getter ---
+  const StateVec & getState()       const { return x_; }
+  const StateMat & getCovariance()  const { return P_; }
+
+  // innovation norm 반환
+  // innovation이 갑자기 폭증하면 EKF가 발산(diverge)하고 있다는 신호임.
+  // → W10 Watchdog에서 이 값으로 Fail-safe 트리거 예정
+  double getInnovationNorm() const { return innovation_norm_; }
+
+private:
+  // --------------------------------------------------------
+  // 비선형 상태 전이 함수 f(x, u)
+  //
+  //   현재 상태 x_와 IMU 입력(ax, ay, ω)을 받아
+  //   dt 후의 예측 상태를 반환함.
+  //
+  //   Diff-Drive 로봇의 운동 방정식 (body frame 기준):
+  //     x_new  = x  + (vx·cos θ - vy·sin θ)·dt
+  //     y_new  = y  + (vx·sin θ + vy·cos θ)·dt
+  //     θ_new  = θ  + ω·dt
+  //     vx_new = vx + ax·dt
+  //     vy_new = vy + ay·dt
+  //     ω_new  = ω_imu  ← IMU 직접 사용 (적분 안 함)
+  //
+  //   [왜 sin/cos가 포함되나?]
+  //     body frame 속도를 world frame 위치로 변환할 때
+  //     로봇의 현재 heading(θ)을 기준으로 회전 변환이 필요하기 때문.
+  // --------------------------------------------------------
+  StateVec motionModel(double ax, double ay, double omega_imu, double dt) const;
+
+  // --------------------------------------------------------
+  // 야코비안 행렬 F 계산
+  //
+  //   EKF는 비선형 함수 f를 현재 상태 주변에서 편미분해서
+  //   선형화함. 이 선형화 행렬이 야코비안 F임.
+  //
+  //   F = ∂f/∂x  (6×6 행렬)
+  //
+  //   비선형 항목(sin θ, cos θ)만 편미분이 생기고
+  //   나머지는 단위행렬 형태가 됨.
+  //   핵심 비선형 편미분:
+  //     ∂x_new/∂θ = (-vx·sin θ - vy·cos θ)·dt
+  //     ∂y_new/∂θ = ( vx·cos θ - vy·sin θ)·dt
+  // --------------------------------------------------------
+  StateMat computeJacobian(double ax, double ay, double omega_imu, double dt) const;
+
+  // --- 멤버 변수 ---
+  StateVec x_;   // 현재 상태 추정값
+  StateMat P_;   // 현재 공분산 (추정 불확실성)
+  StateMat Q_;   // 프로세스 노이즈 공분산
+  Eigen::Matrix<double, OBS_DIM, OBS_DIM> R_;  // 관측 노이즈 공분산
+  ObsMat H_;     // 관측 행렬 (선형이므로 고정값, 매 업데이트마다 계산 불필요)
+
+  double innovation_norm_;  // 최근 update의 innovation 크기
+  bool is_initialized_;     // init() 호출 여부 플래그
+};
+
+}  // namespace estimation
+
+#endif  // ESTIMATION__EKF_CORE_HPP_

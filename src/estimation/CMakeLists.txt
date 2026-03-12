@@ -5,22 +5,71 @@ if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
 
-# find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(amr_msgs REQUIRED)
+find_package(Eigen3 REQUIRED)
+find_package(tf2 REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
+
+include_directories(include)
+
+add_executable(ekf_node
+  src/ekf_core.cpp
+  src/ekf_node.cpp
+  src/main.cpp
+)
+
+ament_target_dependencies(ekf_node
+  rclcpp
+  std_msgs
+  geometry_msgs
+  sensor_msgs
+  nav_msgs
+  amr_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+)
+
+target_link_libraries(ekf_node
+  Eigen3::Eigen
+)
+
+# pose_rmse_node — Ground Truth vs EKF RMSE 계산 노드
+add_executable(pose_rmse_node
+  src/pose_rmse_node.cpp
+)
+
+ament_target_dependencies(pose_rmse_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  amr_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  tf2_msgs
+)
+
+target_link_libraries(pose_rmse_node
+  Eigen3::Eigen
+)
+
+install(TARGETS 
+  ekf_node
+  pose_rmse_node
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
   set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()

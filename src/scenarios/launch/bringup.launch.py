@@ -97,6 +97,11 @@ def generate_launch_description():
                     '/odom@nav_msgs/msg/Odometry[ignition.msgs.Odometry',
                     '/imu@sensor_msgs/msg/Imu[ignition.msgs.IMU',
                     '/scan@sensor_msgs/msg/LaserScan[ignition.msgs.LaserScan',
+                    # Ground Truth: Gazebo 내부 로봇 실제 위치
+                    # → EKF 추정값과 비교해서 RMSE 계산에 사용
+                    # Pose_V: 모든 모델의 포즈를 한 번에 담은 배열 타입
+                    # → TFMessage로 브리지됨, pose_rmse_node에서 amr_robot 포즈만 추출
+                    '/world/simple_room/dynamic_pose/info@tf2_msgs/msg/TFMessage[ignition.msgs.Pose_V',
                 ],
                 output='screen'
             )

@@ -49,7 +49,7 @@
                     rpy: Roll(x축 회전)을 90도(pi/2) 꺾어 원기둥을 세우지 않고 눕혀 굴러가게 함.
                     -->
               <!---base_height/2: 몸체 박스의 바닥면 높이에 바퀴 중심을 맞추기 위함-->
-      <axis xyz="0 0 1"/> <!-- 관절이 회전하는 축 (z축 방향 회전) -->
+      <axis xyz="0 0 -1"/> <!-- 관절이 회전하는 축 (z축 방향 회전) -->
     </joint>
   </xacro:macro>
 
@@ -127,10 +127,10 @@
   <gazebo>
     <plugin filename="libignition-gazebo-diff-drive-system.so"
             name="ignition::gazebo::systems::DiffDrive">
-      <left_joint>front_right_wheel_joint</left_joint>
-      <left_joint>rear_right_wheel_joint</left_joint>
-      <right_joint>front_left_wheel_joint</right_joint>
-      <right_joint>rear_left_wheel_joint</right_joint>
+      <left_joint>front_left_wheel_joint</left_joint>
+      <left_joint>rear_left_wheel_joint</left_joint>
+      <right_joint>front_right_wheel_joint</right_joint>
+      <right_joint>rear_right_wheel_joint</right_joint>
       <wheel_separation>0.45</wheel_separation>
       <wheel_radius>0.1</wheel_radius>
       <topic>/cmd_vel</topic>
@@ -151,7 +151,35 @@
       <topic>/imu</topic>
       <ignition_frame_id>imu_link</ignition_frame_id>
       <plugin filename="libignition-gazebo-imu-system.so"
-        name="ignition::gazebo::systems::Imu"/>  <!-- 추가 -->
+        name="ignition::gazebo::systems::Imu"/>
+      <imu>
+        <!-- 선가속도 노이즈 설정 -->
+        <!-- mean: 바이어스(편향) — 0이 아니면 센서가 한쪽으로 치우친 값을 출력 -->
+        <!-- stddev: 가우시안 노이즈 표준편차 — 클수록 측정값이 더 많이 흔들림 -->
+        <linear_acceleration>
+          <x>
+            <noise type="gaussian">
+              <mean>0.0</mean>    <!-- 노이즈 없음: 0.0 / 노이즈 있음: 0.05 -->
+              <stddev>0.0</stddev><!-- 노이즈 없음: 0.0 / 노이즈 있음: 0.01 -->
+            </noise>
+          </x>
+          <y>
+            <noise type="gaussian">
+              <mean>0.0</mean>
+              <stddev>0.0</stddev>
+            </noise>
+          </y>
+        </linear_acceleration>
+        <!-- 각속도 노이즈 설정 -->
+        <angular_velocity>
+          <z>
+            <noise type="gaussian">
+              <mean>0.0</mean>    <!-- 노이즈 없음: 0.0 / 노이즈 있음: 0.01 -->
+              <stddev>0.0</stddev><!-- 노이즈 없음: 0.0 / 노이즈 있음: 0.005 -->
+            </noise>
+          </z>
+        </angular_velocity>
+      </imu>
     </sensor>
   </gazebo>
 

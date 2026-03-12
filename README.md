@@ -19,7 +19,7 @@
 * **Language:** Modern C++ (17/20), Python 3.10
 * **Optimization:** OSQP (Quadratic Programming), Eigen
 * **Estimation/SLAM:** EKF (robot_localization), slam_toolbox
-* **Simulation:** Gazebo Classic/Ignition, RViz2
+* **Simulation:** Gazebo Fortress, RViz2
 
 ---
 
