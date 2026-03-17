@@ -70,6 +70,11 @@ EkfCore::EkfCore()
 
 // ============================================================
 // 초기화
+// EkfCore::init()이 하는 일:
+// 1. x_ = x0 저장
+// 2. P_ = P0 저장
+// 3. is_initialized_ = true 플래그 설정
+//    → 이후 predict()/update() 호출 허용
 // ============================================================
 void EkfCore::init(const StateVec & x0, const StateMat & P0)
 {

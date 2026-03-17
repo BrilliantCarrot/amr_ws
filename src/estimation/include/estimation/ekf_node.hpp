@@ -38,6 +38,19 @@ public:
   // --------------------------------------------------------
   explicit EkfNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions());
 
+  // explicit: 암묵적 형변환을 막고 명시적 형변환만 허용
+  // rclcpp::NodeOptions 란?
+  // 노드를 생성할 때 옵션을 묶어서 전달하는 설정 객체야.
+  // rclcpp::NodeOptions options;
+  // options.use_intra_process_comms(true);   // 같은 프로세스 내 통신 최적화
+  // options.allow_undeclared_parameters(true); // 미선언 파라미터 허용
+  // options.automatically_declare_parameters_from_overrides(true); // 런타임 파라미터 자동 선언
+
+  // ROS2에서 NodeOptions를 생성자에 넣는 이유:
+  // ROS2 컴포넌트 시스템(component) 때문이야.
+  // 여러 노드를 하나의 프로세스에 합쳐서 실행할 때
+  // (성능 최적화 목적) NodeOptions가 필요함.
+
 private:
   // --------------------------------------------------------
   // IMU 콜백 (200Hz)

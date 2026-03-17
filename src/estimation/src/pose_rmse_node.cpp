@@ -155,6 +155,7 @@ private:
 
     // --------------------------------------------------------
     // 슬라이딩 윈도우 RMSE 계산
+    //   덱(deque) 구조로 윈도우 관리
     //   deque 앞에서 오래된 샘플 제거, 뒤에서 새 샘플 추가.
     //   항상 최근 window_size_ 개 샘플만 유지.
     // --------------------------------------------------------
@@ -164,6 +165,63 @@ private:
         buf.pop_front();
       }
     };
+  //     람다 문법 분해
+  // auto pushWindow = [&](std::deque<double> & buf, double err_sq) {
+  //     // 함수 본문
+  // };
+  // 4개 부분으로 나뉘어:
+  //
+  // auto pushWindow   →  ① 변수 이름 (함수를 담는 그릇)
+  // =                 →  ② 대입
+  // [&]               →  ③ 캡처 (외부 변수 사용 선언)
+  // (deque&, double)  →  ④ 매개변수 (일반 함수와 동일)
+  // { ... }           →  ⑤ 함수 본문
+  // ;                 →  ⑥ 세미콜론 (변수 선언이므로 필요)
+  //
+  //   ③번 캡처 [&] 가 핵심
+  // 람다는 자기 밖에 있는 변수를 쓰려면 캡처를 선언.
+  //  
+  // 이 람다 본문에서 window_size_를 쓰고 있어:
+  // if (static_cast<int>(buf.size()) > window_size_) {
+  //
+  // `window_size_`는 람다 밖, 클래스 멤버변수야. 람다가 이걸 쓰려면 `[&]`로 "외부 변수 전부 참조로 가져오겠다"고 선언해야 함.
+  //
+  // [&]  → 외부 변수를 참조(reference)로 캡처
+  //         → window_size_ 읽기 가능
+  //         → buf_x_, buf_y_ 등도 접근 가능
+  // []   → 아무것도 캡처 안 함 → window_size_ 쓰면 컴파일 에러
+  // [=]  → 외부 변수를 복사(copy)로 캡처 → 값은 읽되 수정 불가
+  //   실제 실행 흐름
+  //
+  // pushWindow(buf_x_, err_x * err_x);
+  //
+  // 이게 실행되면:
+  //
+  // 1. err_x * err_x 계산  →  예: 0.04
+  // 2. pushWindow 호출
+  //      buf     = buf_x_  (참조로 전달, 원본 수정됨)
+  //      err_sq  = 0.04
+  //
+  // 3. buf.push_back(0.04)
+  //      buf_x_ 뒤에 0.04 추가
+  //      buf_x_ = [..., 0.04]
+  //
+  // 4. buf.size() > window_size_ 확인
+  //      size가 100 초과면:
+  //        buf.pop_front()  → 맨 앞 원소 제거
+  //      size가 100 이하면:
+  //        그냥 넘어감
+  //
+  // static_cast<int> 는 왜?
+  // if (static_cast<int>(buf.size()) > window_size_) {
+  // `buf.size()`는 `size_t` 타입이야. C++에서 `size_t`는 부호 없는 정수(unsigned).
+  // `window_size_`는 `int` 타입 (부호 있는 정수).
+  // 부호 없는(size_t) vs 부호 있는(int) 비교
+  // → 컴파일러 경고 발생
+  // → 극단적 경우 음수가 엄청 큰 수로 해석되는 버그 가능
+  // static_cast<int>(buf.size())를 하면
+  // → size_t를 int로 명시적 변환
+  // → 타입 일치 → 경고 없음, 안전한 비교
 
     pushWindow(buf_x_,     err_x    * err_x);
     pushWindow(buf_y_,     err_y    * err_y);
@@ -206,12 +264,14 @@ private:
     }
   }
 
+  // 클래스 멤버 변수 선언 구역
   // --- ROS2 인터페이스 ---
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr    gt_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr     ekf_sub_;
   rclcpp::Publisher<amr_msgs::msg::PoseRmse>::SharedPtr        rmse_pub_;
 
   // --- Ground Truth 캐시 ---
+  // 멤버 변수는 객체(노드)가 생성될 때 만들어지고, 객체가 소멸될 때 사라짐
   double gt_x_   = 0.0;
   double gt_y_   = 0.0;
   double gt_yaw_ = 0.0;
