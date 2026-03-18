@@ -2,7 +2,7 @@
 
 > **GPS-Denied 환경에서의 신뢰성 있는 주행을 위한 LiDAR 로컬라이제이션 및 MPC 기반 AMR 제어 프레임워크**
 
-본 프로젝트는 일반적인 상업용 AMR을 넘어 특수 목적(GPS 불가능 환경)에서도 운용 가능한 수준의 높은 신뢰성과 안전성을 목표로 합니다.
+본 프로젝트는 특수 목적(GPS 불가능 환경)에서도 운용 가능한 수준의 높은 신뢰성과 안전성의 AMR 설계를 목표로 합니다.
 
 ---
 
@@ -10,7 +10,7 @@
 * **GPS-Denied Autonomy:** LiDAR 기반 Localization(slam_toolbox)과 EKF 센서 퓨전을 통해 GPS 없이도 정밀한 위치 추정을 수행합니다.
 * **MPC-based Control:** OSQP 솔버를 이용한 모델 예측 제어(MPC)를 통해 제약 조건(속도/가속도/조향)을 준수하며 최적의 경로를 추종합니다.
 * **Defense-Grade Reliability:** 통신 지연, 센서 데이터 손실 등 극한 상황에 대비한 **Fail-safe State Machine**과 **Watchdog** 시스템을 구축합니다.
-* **Performance Metrics:** 단순히 "동작"하는 것을 넘어, RMSE(오차), Latency(지연), 제어 주기 등을 수치화하여 성능을 증명합니다.
+* **Performance Metrics:** RMSE(오차), Latency(지연), 제어 주기 등을 수치화하여 성능을 증명합니다.
 
 ---
 

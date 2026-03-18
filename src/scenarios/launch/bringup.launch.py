@@ -1,8 +1,10 @@
 import os
 import subprocess
 from launch import LaunchDescription
-from launch.actions import ExecuteProcess, TimerAction
-from launch.substitutions import Command
+from launch.actions import ExecuteProcess, TimerAction, IncludeLaunchDescription, DeclareLaunchArgument
+from launch.conditions import IfCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import Command, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from ament_index_python.packages import get_package_share_directory
@@ -11,6 +13,7 @@ from ament_index_python.packages import get_package_share_directory
 def generate_launch_description():
 
     pkg_scenarios = get_package_share_directory('scenarios')
+    pkg_localization = get_package_share_directory('localization')
     urdf_file  = os.path.join(pkg_scenarios, 'urdf', 'amr_robot.urdf.xacro')
     world_file = os.path.join(pkg_scenarios, 'worlds', 'simple_room.sdf')
 
@@ -74,7 +77,7 @@ def generate_launch_description():
     # bridge는 gazebo의 메시지를 ROS가 이해할 수 있는 메시지 형식으로 변환하여 전달
     # Gazebo → ROS: 시뮬레이션 속 로봇의 센서 데이터(카메라, 라이다, IMU 등)를 ROS 토픽으로 보내줌
     # ROS → Gazebo: ROS에서 계산한 제어 명령(cmd_vel 등)을 Gazebo로 전달하여 로봇을 움직이게 함
-    # 파서는 기호 위치를 기준으로 앞 = ROS2 타입, 뒤 = Ignition(Gazebo) 타입응로 고정 파싱
+    # 파서는 기호 위치를 기준으로 앞 = ROS2 타입, 뒤 = Ignition(Gazebo) 타입으로 고정 파싱
     # 브리지 방향 기호 핵심:
     # 기호              의미                      데이터 흐름
     #  ]      ROS2 → Ignition (단방향)  ROS2가 퍼블리시, Gazebo가 수신
@@ -108,9 +111,34 @@ def generate_launch_description():
         ]
     )
 
+    # slam 모드 인자: true이면 slam_toolbox 노드를 함께 실행
+    # 사용 예: ros2 launch scenarios bringup.launch.py slam:=true
+    declare_slam = DeclareLaunchArgument(
+        'slam',
+        default_value='false',
+        description='true이면 slam_toolbox 맵 생성 모드 실행'
+    )
+    slam = LaunchConfiguration('slam')
+
+    # slam:=true일 때만 slam.launch.py 인클루드
+    # TimerAction으로 브리지/센서가 준비된 후 실행되게 지연 (10초)
+    slam_launch = TimerAction(
+        period=10.0,
+        actions=[
+            IncludeLaunchDescription(
+                PythonLaunchDescriptionSource(
+                    os.path.join(pkg_localization, 'launch', 'slam.launch.py')
+                ),
+                condition=IfCondition(slam),
+            )
+        ]
+    )
+
     return LaunchDescription([
+        declare_slam,
         robot_state_publisher,
         gazebo,
         bridge,
         spawn_robot,
+        slam_launch,
     ])

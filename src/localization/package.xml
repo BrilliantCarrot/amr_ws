@@ -3,15 +3,19 @@
 <package format="3">
   <name>localization</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <description>LiDAR SLAM 맵 생성 및 localization 패키지</description>
   <maintainer email="leeyj950322@gmail.com">lyj</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+
+  <!-- slam_toolbox는 런타임 실행만 필요 → exec_depend만 선언 -->
+  <exec_depend>slam_toolbox</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

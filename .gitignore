@@ -17,3 +17,7 @@ obj/
 .DS_Store
 Thumbs.db
 *.zip
+
+*.gv
+*.pdf
+*.pgm
