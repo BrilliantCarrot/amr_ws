@@ -13,6 +13,12 @@
   <depend>std_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <depend>tf2_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>amr_msgs</depend>
 
   <!-- slam_toolbox는 런타임 실행만 필요 → exec_depend만 선언 -->
   <exec_depend>slam_toolbox</exec_depend>

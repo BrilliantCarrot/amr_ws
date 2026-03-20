@@ -10,6 +10,7 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/ControlLatency.msg"
   "msg/PoseRmse.msg"
   "msg/MinObstacleDistance.msg"
+  "msg/LocalizationStatus.msg"
   DEPENDENCIES std_msgs
 )
 

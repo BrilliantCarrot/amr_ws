@@ -76,9 +76,13 @@ slam_toolbox:
     scan_topic: /scan
 
     # 동작 모드 선택
-    # mapping:      맵을 새로 만드는 모드 (현재 W3)
-    # localization: 저장된 맵 위에서 위치만 추정하는 모드 (W4에서 전환 예정)
-    mode: mapping
+    # mapping:      맵을 새로 만드는 모드
+    # localization: 저장된 맵 위에서 위치만 추정하는 모드
+    mode: localization
+
+    # W4: 저장된 맵 경로 (확장자 없이 입력)
+    # slam_toolbox가 .pgm + .yaml 쌍을 자동으로 로드함
+    map_file_name: /home/lyj/amr_ws/maps/amr_map
 
     # ================================================================
     # [3] 일반 동작 설정
