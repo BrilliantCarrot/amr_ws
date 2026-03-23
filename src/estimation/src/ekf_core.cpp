@@ -66,6 +66,22 @@ EkfCore::EkfCore()
   H_(0, 3) = 1.0;
   H_(1, 4) = 1.0;
   H_(2, 5) = 1.0;
+
+  // LiDAR 관측 행렬 H_lidar — 위치(x, y, θ)를 직접 관측
+  // 상태: [x, y, θ, vx, vy, ω]
+  // LiDAR 관측: [x, y, θ] → 인덱스 0, 1, 2에 해당
+  //
+  //           x   y   θ   vx  vy  ω
+  // H_lidar = [ 1   0   0   0   0   0 ]  ← x  관측
+  //           [ 0   1   0   0   0   0 ]  ← y  관측
+  //           [ 0   0   1   0   0   0 ]  ← θ  관측
+  //
+  // slam_toolbox가 map→base_link TF로 로봇의 절대 위치를 직접 알려주므로
+  // 선형 관측 함수 h_lidar(x) = H_lidar·x 그대로 사용 가능
+  H_lidar_.setZero();
+  H_lidar_(0, 0) = 1.0;
+  H_lidar_(1, 1) = 1.0;
+  H_lidar_(2, 2) = 1.0;
 }
 
 // ============================================================
@@ -294,6 +310,107 @@ void EkfCore::update(double vx_odom, double vy_odom, double omega_odom)
   //     → 이론적으로 P의 양정치성 보장이 더 강함 (이번엔 기본형 사용)
   const StateMat I = StateMat::Identity();
   P_ = (I - K * H_) * P_;
+  // P_ 업데이트 두 가지의 차이: 
+  // 직관적 비유로 먼저 GPS 없이 눈 감고 걷는 상황
+  // P_ = F·P_·Fᵀ + Q_ (predict 단계 — 불확실성 증가)
+  // 비유: "눈 감고 10걸음 걸었어. 내가 어디 있는지 점점 더 모르겠어"
+  // 걸음 수(F)만큼 불확실성이 퍼지고, 발걸음 오차(Q)까지 더해져서 P가 커짐.
+  // P_ = (I - K·H_)·P_ (update 단계 — 불확실성 감소)
+  // "눈 떴더니 표지판이 보여. 아, 내가 여기 있구나"
+  // 센서 관측(H)으로 위치를 확인했으니까 P가 작아짐.
+  // 수식으로 비교
+  // predict:  P_ = F·P_·Fᵀ + Q_        불확실성 증가
+  //                           ↑
+  //                     Q_ 더해짐 → P 커짐
+  // update:   P_ = (I - K·H_)·P_        불확실성 감소
+  //                ↑
+  //           (I - K·H_)는 항상 1보다 작음 → P 작아짐
+  // (I - K·H_)가 왜 1보다 작은지 보면:
+  // K = P·Hᵀ·S⁻¹   (항상 양수)
+  // K·H             (항상 양수)
+  // I - K·H         (항상 1보다 작음)
+}
+
+// ============================================================
+// LiDAR Update 단계
+//   slam_toolbox의 map frame 위치 추정값(x, y, θ)으로
+//   predict + Odom update 이후 누적된 드리프트를 보정함.
+//
+//   [왜 이게 중요한가?]
+//     IMU + Odom만으로는 시간이 지날수록 위치 오차가 누적됨 (드리프트).
+//     LiDAR는 맵과 매칭해서 절대 위치를 알기 때문에
+//     이 업데이트를 주기적으로 받으면 드리프트가 보정됨.
+//
+//   [호출 주기]
+//     slam_toolbox가 map→odom TF를 약 10Hz로 발행하므로
+//     10Hz마다 호출됨 (IMU 200Hz, Odom 50Hz보다 훨씬 느림).
+//
+//   [수식 — Odom update()와 동일한 EKF 수식, 관측 행렬만 다름]
+//     z       = [x_lidar, y_lidar, θ_lidar]ᵀ         ← LiDAR 관측값
+//     y       = z - H_lidar·x_pred                    ← innovation (잔차)
+//     y(2)   정규화: -π ~ π                            ← yaw 불연속 방지
+//     S       = H_lidar·P·H_lidarᵀ + R_lidar          ← innovation 공분산
+//     K       = P·H_lidarᵀ·S⁻¹                        ← 칼만 게인
+//     x       = x_pred + K·y                           ← 상태 보정
+//     x(2)   정규화: -π ~ π                            ← yaw 정규화
+//     P       = (I - K·H_lidar)·P_pred                ← 공분산 갱신
+// ============================================================
+// EkfCore 객체는 상태를 계속 들고 있음
+// 핵심은 ekf_ 객체가 map_ekf_node의 멤버 변수라는 것.
+// class MapEkfNode : public rclcpp::Node {
+//   EkfCore ekf_;   // ← 노드가 살아있는 동안 계속 존재
+// };
+// 그래서:
+// predict()가 갱신한 x_, P_를
+// 다음 update()가 그대로 이어받아서 보정하고
+// 그걸 다음 updateLidar()가 이어받아서 또 보정
+// 하나의 객체 안에서 x_와 P_가 계속 누적·갱신되는 구조. 콜백 3개가 모두 같은 ekf_ 객체를 공유하면서 돌아감.
+void EkfCore::updateLidar(
+  double x_lidar, double y_lidar, double yaw_lidar,
+  const LidarNoiseMat & R_lidar)
+{
+  if (!is_initialized_) {
+    throw std::runtime_error("[EkfCore] updateLidar() 호출 전 init()이 필요함");
+  }
+
+  // 1) LiDAR 관측 벡터 구성
+  LidarObsVec z;
+  z << x_lidar, y_lidar, yaw_lidar;
+
+  // 2) Innovation(잔차) 계산: y = z - H_lidar·x_pred
+  LidarObsVec y = z - H_lidar_ * x_;
+
+  // yaw innovation 정규화: -π ~ π
+  // [왜 필요한가?]
+  //   예: 예측 θ = 3.1rad, 관측 θ = -3.1rad
+  //   단순 빼기: -3.1 - 3.1 = -6.2rad → 잘못된 큰 보정값 발생
+  //   atan2(sin, cos)로 감싸면: ≈ 0.08rad → 실제 차이만 반영
+  y(2) = std::atan2(std::sin(y(2)), std::cos(y(2)));
+
+  // innovation norm 갱신 (W10 Watchdog용)
+  innovation_norm_ = y.norm();
+
+  // 3) Innovation 공분산: S = H_lidar·P·H_lidarᵀ + R_lidar
+  const LidarNoiseMat S = H_lidar_ * P_ * H_lidar_.transpose() + R_lidar;
+
+  // 4) 칼만 게인: K = P·H_lidarᵀ·S⁻¹
+  // [R_lidar가 가변인 이유]
+  //   localization 품질에 따라 LiDAR 관측 신뢰도가 달라짐.
+  //   NORMAL  → R_lidar 작게 → K 커짐 → LiDAR를 적극 반영
+  //   DEGRADED → R_lidar 크게 → K 작아짐 → LiDAR를 조금만 반영
+  //   LOST    → 이 함수 자체를 호출하지 않음 (map_ekf_node에서 처리)
+  const LidarKalmanMat K = P_ * H_lidar_.transpose() *
+    S.ldlt().solve(LidarNoiseMat::Identity());
+
+  // 5) 상태 보정: x = x_pred + K·y
+  x_ = x_ + K * y;
+
+  // yaw 정규화: -π ~ π 유지
+  x_(2) = std::atan2(std::sin(x_(2)), std::cos(x_(2)));
+
+  // 6) 공분산 갱신: P = (I - K·H_lidar)·P_pred
+  const StateMat I = StateMat::Identity();
+  P_ = (I - K * H_lidar_) * P_;
 }
 
 }  // namespace estimation

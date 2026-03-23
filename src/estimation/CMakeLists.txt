@@ -16,6 +16,7 @@ find_package(Eigen3 REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(tf2_msgs REQUIRED)
 
 include_directories(include)
 
@@ -61,9 +62,34 @@ target_link_libraries(pose_rmse_node
   Eigen3::Eigen
 )
 
-install(TARGETS 
+# map_ekf_node — W5 신규: map 프레임 기반 LiDAR fusion EKF
+# ekf_core.cpp를 공유해서 updateLidar()를 그대로 사용함
+add_executable(map_ekf_node
+  src/ekf_core.cpp
+  src/map_ekf_node.cpp
+)
+
+ament_target_dependencies(map_ekf_node
+  rclcpp
+  std_msgs
+  geometry_msgs
+  sensor_msgs
+  nav_msgs
+  amr_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  tf2_msgs
+)
+
+target_link_libraries(map_ekf_node
+  Eigen3::Eigen
+)
+
+install(TARGETS
   ekf_node
   pose_rmse_node
+  map_ekf_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
