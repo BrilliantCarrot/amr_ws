@@ -124,9 +124,6 @@ StateVec MpcCore::motionModel(const StateVec & x, const InputVec & u) const
   x_next(3) = x(3) + u(0);                        // v (Δv 적용)
   x_next(4) = x(4) + u(1);                        // ω (Δω 적용)
 
-  // θ 정규화: -π ~ π 범위 유지
-  x_next(2) = std::atan2(std::sin(x_next(2)), std::cos(x_next(2)));
-
   return x_next;
 }
 

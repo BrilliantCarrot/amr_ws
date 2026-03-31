@@ -162,6 +162,9 @@ private:
   // --- latency 통계 ---
   // 99th percentile 계산을 위해 최근 solve time을 저장
   std::vector<double> latency_history_;
+
+  double prev_raw_theta_    = 0.0;   // 직전 raw atan2 yaw 값 (래핑 delta 계산용)
+  double continuous_theta_  = 0.0;   // 누적 연속 yaw (래핑 없는 절대값)
 };
 
 }  // namespace control_mpc

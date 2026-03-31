@@ -82,7 +82,7 @@ slam_toolbox:
 
     # W4: 저장된 맵 경로 (확장자 없이 입력)
     # slam_toolbox가 .pgm + .yaml 쌍을 자동으로 로드함
-    map_file_name: /home/lyj/amr_ws/maps/amr_map
+    map_file_name: /home/lyj/amr_ws/maps/amr_map_empty
 
     # ================================================================
     # [3] 일반 동작 설정

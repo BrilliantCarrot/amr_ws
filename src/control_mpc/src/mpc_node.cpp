@@ -36,7 +36,7 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
 
   // 경로 관련 파라미터
   this->declare_parameter("trajectory_type", std::string("straight"));
-  this->declare_parameter("goal_tolerance",  0.1);
+  this->declare_parameter("goal_tolerance",  0.15);
 
   // 파라미터 로드
   mpc_params_       = loadMpcParams();
@@ -104,8 +104,15 @@ void MpcNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
   double qy = msg->pose.pose.orientation.y;
   double qz = msg->pose.pose.orientation.z;
   double qw = msg->pose.pose.orientation.w;
-  x0_(2) = std::atan2(2.0 * (qw * qz + qx * qy),
-                      1.0 - 2.0 * (qy * qy + qz * qz));
+  // x0_(2) = std::atan2(2.0 * (qw * qz + qx * qy),
+  //                     1.0 - 2.0 * (qy * qy + qz * qz));
+  double raw_theta = std::atan2(2.0 * (qw * qz + qx * qy),  
+                                1.0 - 2.0 * (qy * qy + qz * qz));
+  double delta = std::atan2(std::sin(raw_theta - prev_raw_theta_),
+                             std::cos(raw_theta - prev_raw_theta_));
+  continuous_theta_ += delta;
+  prev_raw_theta_    = raw_theta;
+  x0_(2) = continuous_theta_;
 
   // 속도: Odometry의 twist는 child_frame(base_link) 기준
   // Diff-Drive이므로 linear.x = v, angular.z = ω
@@ -244,7 +251,9 @@ void MpcNode::controlCallback()
 void MpcNode::initWaypoints()
 {
   waypoints_.clear();
-  double v_ref = 0.3;   // 기준 주행 속도 [m/s]
+  double v_ref = 0.15;  // 원형 경로: 선형화 오차 줄이기 위해 속도 절반
+  // v=0.3이면 N=20 구간(0.4s)에서 heading이 0.12rad 변화
+  // v=0.15이면 0.06rad 변화 → linearization 오차 절반
 
   if (trajectory_type_ == "straight") {
     // 직선: x 방향으로 5m, 0.1m 간격
@@ -254,7 +263,7 @@ void MpcNode::initWaypoints()
       wp(0) = i * 0.1;   // x
       wp(1) = 0.0;       // y
       wp(2) = 0.0;       // θ (정면)
-      wp(3) = v_ref;     // v
+      wp(3) = 0.3;     // v
       wp(4) = 0.0;       // ω
       waypoints_.push_back(wp);
     }
@@ -262,9 +271,9 @@ void MpcNode::initWaypoints()
 
   } else if (trajectory_type_ == "circle") {
     // 원: 반지름 1.5m, 반시계 방향
-    double r      = 1.5;
+    double r      = 0.5;
     double period = 2.0 * M_PI * r / v_ref;    // 한 바퀴 걸리는 시간 [s]
-    double dt_wp  = 0.1;                         // waypoint 간격 [s]
+    double dt_wp  = mpc_params_.dt;                         // waypoint 간격 [s]
     int    n_pts  = static_cast<int>(period / dt_wp);
     double w_ref  = v_ref / r;                   // ω = v/r
 
@@ -275,7 +284,6 @@ void MpcNode::initWaypoints()
       wp(0) = r * std::cos(ang) - r;   // 원점에서 출발하도록 오프셋
       wp(1) = r * std::sin(ang);
       wp(2) = ang + M_PI / 2.0;        // 접선 방향 (θ = 각도 + 90°)
-      wp(2) = std::atan2(std::sin(wp(2)), std::cos(wp(2)));  // 정규화
       wp(3) = v_ref;
       wp(4) = w_ref;
       waypoints_.push_back(wp);
@@ -285,30 +293,30 @@ void MpcNode::initWaypoints()
   } else if (trajectory_type_ == "figure8") {
     // 8자: lemniscate 근사 (두 원을 이어붙인 형태)
     double r      = 1.0;
-    double dt_wp  = 0.1;
+    double dt_wp  = mpc_params_.dt;  // 예측 주기와 동일하게 맞춤 (0.02)
     double w_ref  = v_ref / r;
-    int    n_half = static_cast<int>(M_PI * r / v_ref / dt_wp);   // 반원 점 수
+    int    n_half = static_cast<int>(M_PI * r / v_ref / dt_wp);
 
-    // 첫 번째 원 (반시계)
+    // 첫 번째 원 (반시계, 왼쪽 원)
     for (int i = 0; i <= n_half * 2; ++i) {
       double ang = w_ref * i * dt_wp;
       StateVec wp;
       wp(0) =  r * std::cos(ang) - r;
       wp(1) =  r * std::sin(ang);
-      wp(2) = ang + M_PI / 2.0;
-      wp(2) = std::atan2(std::sin(wp(2)), std::cos(wp(2)));
+      // wp(2)는 generateReference에서 실시간 계산하므로 생략
       wp(3) = v_ref;
       wp(4) = w_ref;
       waypoints_.push_back(wp);
     }
-    // 두 번째 원 (시계)
-    for (int i = 0; i <= n_half * 2; ++i) {
-      double ang = -w_ref * i * dt_wp;
+    
+    // 두 번째 원 (시계, 오른쪽 원)
+    // i = 1부터 시작하여 첫 번째 원의 마지막 점(0,0)과 중복되는 것을 방지
+    for (int i = 1; i <= n_half * 2; ++i) {
+      double ang = M_PI - w_ref * i * dt_wp;
       StateVec wp;
       wp(0) =  r * std::cos(ang) + r;
-      wp(1) = -r * std::sin(ang);
-      wp(2) = ang - M_PI / 2.0;
-      wp(2) = std::atan2(std::sin(wp(2)), std::cos(wp(2)));
+      wp(1) =  r * std::sin(ang);
+      // wp(2)는 실시간 계산하므로 생략
       wp(3) = v_ref;
       wp(4) = -w_ref;
       waypoints_.push_back(wp);
@@ -349,13 +357,15 @@ int MpcNode::findClosestWaypoint(const StateVec & x0)
     }
   }
 
-  // goal tolerance 도달 시 미션 완료
-  if (best_idx >= n - 1) {
+  // (수정된 코드)
+  // 경로의 90% 이상을 진행했고, 마지막 목적지와의 거리가 허용 범위 이내일 때 종료
+  // (8자 궤적처럼 시작과 끝이 겹치는 경우, 출발 직후 종료되는 것을 막기 위해 90% 조건 추가)
+  if (best_idx > n * 0.9) {
     double dx = x0(0) - waypoints_.back()(0);
     double dy = x0(1) - waypoints_.back()(1);
     if (std::sqrt(dx * dx + dy * dy) < goal_tolerance_) {
       mission_done_ = true;
-      RCLCPP_INFO(this->get_logger(), "미션 완료! 목표 지점 도달");
+      RCLCPP_INFO(this->get_logger(), "미션 완료! 목표 지점 도달 (현재 idx: %d)", best_idx);
     }
   }
 
@@ -377,9 +387,31 @@ std::vector<StateVec> MpcNode::generateReference(const StateVec & x0)
   int n = static_cast<int>(waypoints_.size());
   std::vector<StateVec> x_ref(mpc_params_.N + 1);
 
-  for (int k = 0; k <= mpc_params_.N; ++k) {
-    int idx = std::min(closest_wp_idx_ + k, n - 1);
+for (int k = 0; k <= mpc_params_.N; ++k) {
+    int idx      = std::min(closest_wp_idx_ + k, n - 1);
+    int idx_next = std::min(idx + 1, n - 1);
     x_ref[k] = waypoints_[idx];
+
+    // 실시간 Heading 계산
+    double dx = waypoints_[idx_next](0) - waypoints_[idx](0);
+    double dy = waypoints_[idx_next](1) - waypoints_[idx](1);
+
+    // 이전 x_ref yaw 기준으로 연속성 유지 (-π~π 점프 방지)
+    double ref_yaw_base = (k == 0) ? x0(2) : x_ref[k - 1](2);
+    double raw_yaw;
+
+    // 두 waypoint가 너무 가까워서 dx, dy가 0에 수렴하는 경우 방어 (atan2(0,0) 발산 방지)
+    if (std::abs(dx) < 1e-5 && std::abs(dy) < 1e-5) {
+      raw_yaw = ref_yaw_base; // 방향을 알 수 없으므로 직전의 헤딩을 그대로 유지
+    } else {
+      raw_yaw = std::atan2(dy, dx);
+    }
+
+    // 연속성 유지의 핵심 로직
+    double diff = std::atan2(
+      std::sin(raw_yaw - ref_yaw_base),
+      std::cos(raw_yaw - ref_yaw_base));
+    x_ref[k](2) = ref_yaw_base + diff;
   }
 
   return x_ref;
