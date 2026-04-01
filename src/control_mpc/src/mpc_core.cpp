@@ -124,6 +124,9 @@ StateVec MpcCore::motionModel(const StateVec & x, const InputVec & u) const
   x_next(3) = x(3) + u(0);                        // v (Δv 적용)
   x_next(4) = x(4) + u(1);                        // ω (Δω 적용)
 
+  // θ 정규화 제거
+  // mpc_node에서 연속값(Continuous Yaw)으로 넘겨주므로, 
+  // 선형화 오차 누적을 막기 위해 모델 내부에서도 절대값 연속성을 그대로 유지함
   return x_next;
 }
 

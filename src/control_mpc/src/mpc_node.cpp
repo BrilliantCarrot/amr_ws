@@ -37,11 +37,15 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   // 경로 관련 파라미터
   this->declare_parameter("trajectory_type", std::string("straight"));
   this->declare_parameter("goal_tolerance",  0.15);
+  this->declare_parameter("delay_ms",        0.0); // 기본값은 지연 없음
+  this->declare_parameter("slip_ratio",      0.0); // 기본값은 슬립 없음
 
   // 파라미터 로드
   mpc_params_       = loadMpcParams();
   trajectory_type_  = this->get_parameter("trajectory_type").as_string();
   goal_tolerance_   = this->get_parameter("goal_tolerance").as_double();
+  delay_ms_         = this->get_parameter("delay_ms").as_double();
+  slip_ratio_       = this->get_parameter("slip_ratio").as_double();
 
   // --- MPC 초기화 ---
   mpc_core_.init(mpc_params_);
@@ -143,26 +147,28 @@ void MpcNode::locStatusCallback(
 //
 //   매 20ms마다 실행:
 //   1. 상태 확인 (odom 수신 여부, localization 상태)
-//   2. reference trajectory 생성
-//   3. MPC solve
-//   4. u0 → v, ω 변환 후 /cmd_vel 발행
-//   5. latency 발행
+//   2. 상태 예측 지연 보상 (Delay Compensation) - 연속성 유지
+//   3. reference trajectory 생성 (예측된 미래 상태 기준)
+//   4. MPC solve
+//   5. u0 → v, ω 변환 후 /cmd_vel 발행 (지연 큐로 전달)
+//   6. latency 발행
 // ============================================================
 
 void MpcNode::controlCallback()
 {
-  // odom 미수신 시 대기
+  // 1. odom 미수신 시 대기
   if (!has_odom_) {
     return;
   }
 
-  // Localization LOST 시 정지
+  // 2. Localization LOST 시 즉시 정지 및 루프 탈출
   if (loc_status_ == 2) {
     publishStop();
     return;
   }
 
-  // 미션 완료 시 정지
+  // 3. 미션 완료 시 정지 명령 유지 및 제어 루프 완전 차단
+  // (이 return이 없으면 목표점 도달 후에도 로봇이 멈추지 않고 계속 맴돌게 됩니다)
   if (mission_done_) {
     publishStop();
     return;
@@ -170,15 +176,43 @@ void MpcNode::controlCallback()
 
   auto t_start = std::chrono::high_resolution_clock::now();
 
+  // ----------------------------------------------------------------
+  // [지연 보상 (Delay Compensation) 로직]
+  // 큐에 대기 중인 과거의 명령들을 이용해, 지연 시간(delay_ms_) 후 
+  // 로봇이 실제로 도달해 있을 미래 위치를 물리 모델로 미리 계산
+  // 현재 상태(x0_)에서 출발하여, 큐에 쌓여있는(아직 실행 안 된) 명령들을 
+  // 운동학 모델로 미리 시뮬레이션하여 지연 시간 이후의 미래 상태를 예측함.
+  // ----------------------------------------------------------------
+  StateVec x_pred = x0_;
+  if (delay_ms_ > 0.0 && !delay_queue_.empty()) {
+    double dt_step = mpc_params_.dt;
+    for (const auto & msg : delay_queue_) {
+      double v = msg.linear.x;
+      double w = msg.angular.z;
+
+      // Forward Kinematics (예측)
+      x_pred(0) += v * std::cos(x_pred(2)) * dt_step;
+      x_pred(1) += v * std::sin(x_pred(2)) * dt_step;
+      x_pred(2) += w * dt_step;
+      x_pred(3) = v;
+      x_pred(4) = w;
+    }
+    // 주의: 여기서 x_pred(2)에 대해 atan2 정규화를 하지 않음
+    // EKF에서 올라온 누적 연속 Yaw 값을 그대로 유지해야 2\pi 점프에 의한 발산이 안 생깁니다.
+  }
+
   // --- 1. reference trajectory 생성 ---
-  std::vector<StateVec> x_ref = generateReference(x0_);
+  // 현재 위치(x0_)가 아닌 '예측된 미래 위치(x_pred)'를 기준으로 목표 궤적을 깎음
+  std::vector<StateVec> x_ref = generateReference(x_pred);
 
   // --- 2. MPC solve ---
-  MpcSolution sol = mpc_core_.solve(x0_, x_ref, u_prev_);
+  // 최적화 시작점도 '미래 위치'로 설정합니다.
+  MpcSolution sol = mpc_core_.solve(x_pred, x_ref, u_prev_);
 
   auto t_end = std::chrono::high_resolution_clock::now();
   double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
+  // 최적해 도출 실패 시 비상 정지
   if (!sol.success) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
       "MPC solve 실패 — 정지 명령");
@@ -191,24 +225,24 @@ void MpcNode::controlCallback()
   double v_cmd = u_prev_(0) + sol.u0(0);
   double w_cmd = u_prev_(1) + sol.u0(1);
 
-  // DEGRADED 상태: 속도 50% 제한
+  // DEGRADED 상태: 속도를 안전하게 50%로 제한
   if (loc_status_ == 1) {
     v_cmd *= 0.5;
     w_cmd *= 0.5;
   }
 
-  // 안전 클리핑 (혹시 모를 수치 오차 대비)
+  // 물리적 한계치 클리핑 (파라미터 제약 준수)
   v_cmd = std::clamp(v_cmd, mpc_params_.v_min, mpc_params_.v_max);
   w_cmd = std::clamp(w_cmd, mpc_params_.w_min, mpc_params_.w_max);
 
-  // --- 4. /cmd_vel 발행 ---
+  // --- 4. /cmd_vel 발행 (큐를 통해 지연 발행됨) ---
   publishCmdVel(v_cmd, w_cmd);
 
-  // 이전 입력 갱신 (다음 스텝 Δu 계산용)
+  // 이전 입력 갱신 (다음 스텝의 Δu 계산 및 지연 보상에 사용)
   u_prev_(0) = v_cmd;
   u_prev_(1) = w_cmd;
 
-  // --- 5. latency 통계 발행 ---
+  // --- 5. latency 통계 산출 및 발행 ---
   latency_history_.push_back(elapsed_ms);
 
   // 최근 500샘플(10초)만 유지
@@ -221,7 +255,7 @@ void MpcNode::controlCallback()
   for (double v : latency_history_) avg_ms += v;
   avg_ms /= latency_history_.size();
 
-  // 최대값
+  // 최대값 계산
   double max_ms = *std::max_element(latency_history_.begin(), latency_history_.end());
 
   amr_msgs::msg::ControlLatency lat_msg;
@@ -230,8 +264,8 @@ void MpcNode::controlCallback()
   lat_msg.max_latency_ms = max_ms;
   latency_pub_->publish(lat_msg);
 
-  // 주기적 로그 (1Hz)
-  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+  // 주기적 터미널 로그 (1Hz)
+  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
     "[MPC] solve=%.2fms avg=%.2fms | v=%.3f w=%.3f | cost=%.2f",
     elapsed_ms, avg_ms, v_cmd, w_cmd, sol.cost);
 }
@@ -273,6 +307,7 @@ void MpcNode::initWaypoints()
     // 원: 반지름 1.5m, 반시계 방향
     double r      = 0.5;
     double period = 2.0 * M_PI * r / v_ref;    // 한 바퀴 걸리는 시간 [s]
+    // MPC 예측 주기와 동일하게 맞춤 (0.02s)
     double dt_wp  = mpc_params_.dt;                         // waypoint 간격 [s]
     int    n_pts  = static_cast<int>(period / dt_wp);
     double w_ref  = v_ref / r;                   // ω = v/r
@@ -292,7 +327,7 @@ void MpcNode::initWaypoints()
 
   } else if (trajectory_type_ == "figure8") {
     // 8자: lemniscate 근사 (두 원을 이어붙인 형태)
-    double r      = 1.0;
+    double r      = 0.7;
     double dt_wp  = mpc_params_.dt;  // 예측 주기와 동일하게 맞춤 (0.02)
     double w_ref  = v_ref / r;
     int    n_half = static_cast<int>(M_PI * r / v_ref / dt_wp);
@@ -357,16 +392,18 @@ int MpcNode::findClosestWaypoint(const StateVec & x0)
     }
   }
 
-  // (수정된 코드)
-  // 경로의 90% 이상을 진행했고, 마지막 목적지와의 거리가 허용 범위 이내일 때 종료
-  // (8자 궤적처럼 시작과 끝이 겹치는 경우, 출발 직후 종료되는 것을 막기 위해 90% 조건 추가)
-  if (best_idx > n * 0.9) {
-    double dx = x0(0) - waypoints_.back()(0);
-    double dy = x0(1) - waypoints_.back()(1);
-    if (std::sqrt(dx * dx + dy * dy) < goal_tolerance_) {
+  // ----------------------------------------------------------------
+  // [종료 조건] 거리(Tolerance)나 특정 좌표에 얽매이지 않고,
+  // '로봇이 추종해야 할 궤적의 맨 끝단(마지막 2개 포인트)에 도달했는가?'로 판정
+  // n-2 도달 시 목표를 달성한 것으로 간주하고 제어 루프를 종료함.
+  // ----------------------------------------------------------------
+  if (best_idx >= n - 2) {
+    // double dx = x0(0) - waypoints_.back()(0);
+    // double dy = x0(1) - waypoints_.back()(1);
+    // if (std::sqrt(dx * dx + dy * dy) < goal_tolerance_) {
       mission_done_ = true;
-      RCLCPP_INFO(this->get_logger(), "미션 완료! 목표 지점 도달 (현재 idx: %d)", best_idx);
-    }
+      RCLCPP_INFO(this->get_logger(), "미션 완료! 목표 지점 도달 (현재 idx: %d / 총 %d)", best_idx, n-1);
+    // }
   }
 
   return best_idx;
@@ -378,39 +415,69 @@ int MpcNode::findClosestWaypoint(const StateVec & x0)
 //   closest waypoint에서 시작해서 N개를 순서대로 추출.
 //   waypoint 부족하면 마지막 waypoint 반복.
 // ============================================================
-
+/**
+ * @brief MPC의 예측 지평선(N) 동안 로봇이 추종해야 할 목표 상태(Reference Trajectory)를 생성합니다.
+ * @param x0 현재 로봇의 상태 [x, y, θ, v, ω] (지연 보상이 적용된 예측 위치일 수 있음)
+ * @return std::vector<StateVec> N+1개의 목표 상태 벡터 시퀀스
+ */
 std::vector<StateVec> MpcNode::generateReference(const StateVec & x0)
 {
   // 가장 가까운 waypoint 갱신
+  // 1. 현재 위치에서 전체 경로(Waypoints) 중 가장 가까운 점의 인덱스를 찾습니다.
+  // 이 인덱스를 기준으로 MPC의 예측 지평선(Horizon)을 전개합니다.
   closest_wp_idx_ = findClosestWaypoint(x0);
 
   int n = static_cast<int>(waypoints_.size());
+  // 2. 결과를 담을 벡터를 선언합니다. 크기는 N+1입니다.
+  // (현재 시점 k=0부터 예측 종료 시점 k=N까지 총 N+1개의 상태가 필요함)
   std::vector<StateVec> x_ref(mpc_params_.N + 1);
-
+  // 3. 예측 지평선의 각 스텝(k)에 대해 목표 상태를 결정합니다.
 for (int k = 0; k <= mpc_params_.N; ++k) {
+    // [인덱싱 관리]
+    // 현재 인덱스에서 k만큼 떨어진 점을 가져오되, 전체 경로의 마지막 점(n-1)을 넘지 않도록 제한(std::min)합니다.
     int idx      = std::min(closest_wp_idx_ + k, n - 1);
     int idx_next = std::min(idx + 1, n - 1);
+    // 기본 정보(좌표, 속도 등)는 미리 저장된 waypoints_ 배열에서 복사합니다.
     x_ref[k] = waypoints_[idx];
 
     // 실시간 Heading 계산
+    // -------------------------------------------------------------------------
+    // [실시간 Heading(Yaw) 및 연속성 계산]
+    // 경로 데이터에는 좌표만 있는 경우가 많으므로, 두 점 사이의 기하학적 각도를 실시간으로 계산합니다.
+    // -------------------------------------------------------------------------
+    // 현재 점과 다음 점 사이의 위치 차이를 계산합니다.
     double dx = waypoints_[idx_next](0) - waypoints_[idx](0);
     double dy = waypoints_[idx_next](1) - waypoints_[idx](1);
 
     // 이전 x_ref yaw 기준으로 연속성 유지 (-π~π 점프 방지)
+    // [연속성 유지를 위한 기준 각도 설정]
+    // k=0(현재 시점)이면 로봇의 현재 각도(x0(2))를 기준으로 삼고,
+    // k>0이면 직전 스텝에서 계산된 목표 각도(x_ref[k-1](2))를 기준으로 삼습니다.
     double ref_yaw_base = (k == 0) ? x0(2) : x_ref[k - 1](2);
     double raw_yaw;
 
     // 두 waypoint가 너무 가까워서 dx, dy가 0에 수렴하는 경우 방어 (atan2(0,0) 발산 방지)
+    // [수학적 특이점 방어 (Singularity Defense)]
+    // 두 점 사이의 거리가 너무 가까우면(1e-5 미만) atan2(0,0)에 의해 각도가 0으로 발산할 수 있습니다.
+    // 이 경우 방향을 정의할 수 없으므로, 이전의 기준 각도를 그대로 유지하여 급격한 회전을 방지합니다.
     if (std::abs(dx) < 1e-5 && std::abs(dy) < 1e-5) {
       raw_yaw = ref_yaw_base; // 방향을 알 수 없으므로 직전의 헤딩을 그대로 유지
     } else {
+      // 일반적인 경우, 두 점이 이루는 벡터의 탄젠트 각도를 계산합니다.
       raw_yaw = std::atan2(dy, dx);
     }
 
     // 연속성 유지의 핵심 로직
+    // [각도 불연속성 해결 (Yaw Continuity Logic)]
+    // atan2는 -π ~ π 사이의 값만 반환하므로, 각도가 경계선을 지날 때 2π(360도)만큼 값이 튀는 현상이 발생합니다.
+    // 이를 방지하기 위해 '기준 각도'와 '계산된 각도' 사이의 최소 차이(diff)를 구합니다.
+    // sin/cos을 사용한 atan2 방식은 각도 차이를 항상 -π ~ π 범위로 정규화해 주는 표준적인 기법입니다.
     double diff = std::atan2(
       std::sin(raw_yaw - ref_yaw_base),
       std::cos(raw_yaw - ref_yaw_base));
+    // 기준 각도에 최소 차이만큼만 더해줌으로써, 각도가 경계선을 넘어도 
+    // 값이 튀지 않고 3.14 -> 3.15... 처럼 선형적으로 증가(Continuous Yaw)하게 만듭니다.
+    // 이는 선형화 MPC의 안정성을 결정짓는 가장 중요한 수치 처리 과정입니다.
     x_ref[k](2) = ref_yaw_base + diff;
   }
 
@@ -418,21 +485,48 @@ for (int k = 0; k <= mpc_params_.N; ++k) {
 }
 
 // ============================================================
-// publishCmdVel() — /cmd_vel 발행
+// publishCmdVel() — /cmd_vel 발행 (지연 및 슬립 외란 적용)
+// 자율주행에서 제어 지연이란 "로봇의 뇌(CPU)가 멈추는 것"이 아니라, "CPU는 50Hz로 빠르게 생각하는데, 
+// 명령이 바퀴(모터)까지 전달되는 데 시간이 걸리는 것(통신/기구학적 지연)"을 의미.
 // ============================================================
-
 void MpcNode::publishCmdVel(double v, double omega)
 {
   geometry_msgs::msg::Twist msg;
-  msg.linear.x  = v;      // 선속도 [m/s]
-  msg.angular.z = omega;  // 각속도 [rad/s]
-  cmd_vel_pub_->publish(msg);
+  msg.linear.x  = v;      
+  msg.angular.z = omega;  
+
+  if (delay_ms_ > 0.0) {
+    // 1. 계산된 원본 명령을 큐에 보관 (MPC는 이 값을 바탕으로 미래를 예측함)
+    delay_queue_.push_back(msg);
+
+    int delay_steps = static_cast<int>(delay_ms_ / (mpc_params_.dt * 1000.0));
+
+    if (static_cast<int>(delay_queue_.size()) > delay_steps) {
+      geometry_msgs::msg::Twist pop_msg = delay_queue_.front();
+      delay_queue_.pop_front();
+      
+      // [외란 주입] 실제 모터로 전달되기 직전에 슬립 발생
+      // 로봇은 MPC가 의도한 속도보다 slip_ratio_ 만큼 느리게 움직이게 됨
+      geometry_msgs::msg::Twist slip_msg;
+      slip_msg.linear.x  = pop_msg.linear.x * (1.0 - slip_ratio_);
+      slip_msg.angular.z = pop_msg.angular.z * (1.0 - slip_ratio_);
+      cmd_vel_pub_->publish(slip_msg);
+    } else {
+      geometry_msgs::msg::Twist stop_msg;
+      cmd_vel_pub_->publish(stop_msg);
+    }
+  } else {
+    // 지연이 없을 때도 슬립 외란 적용
+    geometry_msgs::msg::Twist slip_msg;
+    slip_msg.linear.x  = msg.linear.x * (1.0 - slip_ratio_);
+    slip_msg.angular.z = msg.angular.z * (1.0 - slip_ratio_);
+    cmd_vel_pub_->publish(slip_msg);
+  }
 }
 
 // ============================================================
 // publishStop() — 정지 명령 발행
 // ============================================================
-
 void MpcNode::publishStop()
 {
   geometry_msgs::msg::Twist msg;
@@ -440,9 +534,36 @@ void MpcNode::publishStop()
   msg.angular.z = 0.0;
   cmd_vel_pub_->publish(msg);
 
-  // 이전 입력도 0으로 초기화
+  // 이전 입력 초기화 및 남아있는 지연 명령 싹 비우기
   u_prev_.setZero();
+  delay_queue_.clear();
 }
+// // ============================================================
+// // publishCmdVel() — /cmd_vel 발행
+// // ============================================================
+
+// void MpcNode::publishCmdVel(double v, double omega)
+// {
+//   geometry_msgs::msg::Twist msg;
+//   msg.linear.x  = v;      // 선속도 [m/s]
+//   msg.angular.z = omega;  // 각속도 [rad/s]
+//   cmd_vel_pub_->publish(msg);
+// }
+
+// // ============================================================
+// // publishStop() — 정지 명령 발행
+// // ============================================================
+
+// void MpcNode::publishStop()
+// {
+//   geometry_msgs::msg::Twist msg;
+//   msg.linear.x  = 0.0;
+//   msg.angular.z = 0.0;
+//   cmd_vel_pub_->publish(msg);
+
+//   // 이전 입력도 0으로 초기화
+//   u_prev_.setZero();
+// }
 
 // ============================================================
 // loadMpcParams() — ROS2 파라미터 → MpcParams 변환

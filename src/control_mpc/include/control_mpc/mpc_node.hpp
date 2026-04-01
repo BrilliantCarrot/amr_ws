@@ -27,6 +27,7 @@
 // ============================================================
 
 #include <rclcpp/rclcpp.hpp>
+#include <deque>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <amr_msgs/msg/control_latency.hpp>
@@ -155,6 +156,13 @@ private:
   // --- 파라미터 ---
   std::string trajectory_type_;  // "straight" / "circle" / "figure8"
   double      goal_tolerance_;   // waypoint 도달 판정 거리 [m]
+  double      delay_ms_;         // 제어 지연 주입용 파라미터 [ms]
+  // W7: 바퀴 슬립 외란 주입용 파라미터 (0.0 ~ 1.0)
+  // 예: 0.3이면 명령한 동력의 30%가 헛바퀴로 날아감을 의미
+  double      slip_ratio_;       
+
+  // W7: 진짜 제어 지연 주입을 위한 큐
+  std::deque<geometry_msgs::msg::Twist> delay_queue_;
 
   // MPC 파라미터 (ROS2 파라미터에서 로드)
   MpcParams mpc_params_;
