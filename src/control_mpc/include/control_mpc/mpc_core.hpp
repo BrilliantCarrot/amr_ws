@@ -52,6 +52,15 @@ using CostStateMat  = Eigen::Matrix<double, NX, NX>;      // Q 가중치 행렬
 using CostInputMat  = Eigen::Matrix<double, NU, NU>;      // R 가중치 행렬
 
 // ============================================================
+// 정적 장애물 정보 구조체
+// ============================================================
+struct Obstacle {
+  double x;       // 장애물 중심 x [m] (map frame)
+  double y;       // 장애물 중심 y [m] (map frame)
+  double radius;  // 장애물 반경 [m] (크기의 절반 + 로봇 반경)
+};
+
+// ============================================================
 // MPC 파라미터 구조체
 // ============================================================
 struct MpcParams
@@ -81,6 +90,10 @@ struct MpcParams
   double dv_min = -0.1;  // 최소 선속도 변화량  [m/s per step]
   double dw_max =  0.2;  // 최대 각속도 변화량  [rad/s per step] → 각가속도 최대 10 rad/s²
   double dw_min = -0.2;  // 최소 각속도 변화량  [rad/s per step]
+
+  // W8: 장애물 soft penalty 파라미터
+  double obs_weight    = 200.0;  // 장애물 penalty 가중치 (클수록 강하게 회피)
+  double obs_safe_dist =  0.6;   // penalty 시작 거리 [m] (이 이내로 들어오면 penalty 발생)
 };
 
 // ============================================================
@@ -239,6 +252,9 @@ public:
   const MpcParams & getParams() const { return params_; }
   // 현재 MPC 파라미터 읽기 (외부에서 N, dt, Q, R 등 확인용)
   // const 반환 → 외부에서 파라미터 수정 불가, 읽기 전용
+
+  // W8: 장애물 목록 설정 (mpc_node에서 호출)
+  void setObstacles(const std::vector<Obstacle> &obstacles);
 
 private:
   // 비선형 운동 모델 f(x, u)
@@ -422,6 +438,9 @@ private:
   // solve() 진입 시 첫 번째로 확인
   // false이면 solve() 즉시 실패 반환 (미초기화 상태에서 접근 방지)
   // init() 마지막 줄에서 true로 설정됨
+
+  // W8: 장애물 목록 (map frame 기준)
+  std::vector<Obstacle> obstacles_;
 };
 
 }  // namespace control_mpc

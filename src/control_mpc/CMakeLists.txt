@@ -12,6 +12,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(amr_msgs REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_msgs  REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
@@ -44,8 +45,27 @@ target_link_libraries(mpc_node
   ${OSQP_LIB}
 )
 
+# ----------------------------------------------------------------
+# tracking_rmse_node — MPC 추종 오차 측정 노드
+#   /mpc/reference_pose (목표) vs GT → /metrics/tracking_rmse 발행
+#   OSQP 링크 불필요 (순수 ROS2 + tf2 노드)
+# ----------------------------------------------------------------
+add_executable(tracking_rmse_node
+  src/tracking_rmse_node.cpp
+)
+
+ament_target_dependencies(tracking_rmse_node
+  rclcpp
+  geometry_msgs
+  tf2_msgs
+  amr_msgs
+  tf2
+  tf2_ros
+)
+
 install(TARGETS
   mpc_node
+  tracking_rmse_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

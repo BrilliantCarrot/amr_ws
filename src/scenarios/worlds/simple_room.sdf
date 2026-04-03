@@ -93,13 +93,13 @@
     <!-- 북쪽 벽 -->
     <model name="wall_north">
       <static>true</static>
-      <pose>0 5.0 0.5 0 0 0</pose>
+      <pose>0 2.5 0.5 0 0 0</pose>
       <link name="link">
         <collision name="collision">
-          <geometry><box><size>10.0 0.1 1.0</size></box></geometry>
+          <geometry><box><size>5.0 0.1 1.0</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>10.0 0.1 1.0</size></box></geometry>
+          <geometry><box><size>5.0 0.1 1.0</size></box></geometry>
           <material><ambient>0.5 0.5 0.5 1</ambient></material>
         </visual>
       </link>
@@ -108,13 +108,13 @@
     <!-- 남쪽 벽 -->
     <model name="wall_south">
       <static>true</static>
-      <pose>0 -5.0 0.5 0 0 0</pose>
+      <pose>0 -2.5 0.5 0 0 0</pose>
       <link name="link">
         <collision name="collision">
-          <geometry><box><size>10.0 0.1 1.0</size></box></geometry>
+          <geometry><box><size>5.0 0.1 1.0</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>10.0 0.1 1.0</size></box></geometry>
+          <geometry><box><size>5.0 0.1 1.0</size></box></geometry>
           <material><ambient>0.5 0.5 0.5 1</ambient></material>
         </visual>
       </link>
@@ -123,13 +123,13 @@
     <!-- 동쪽 벽 -->
     <model name="wall_east">
       <static>true</static>
-      <pose>5.0 0 0.5 0 0 0</pose>
+      <pose>2.5 0 0.5 0 0 0</pose>
       <link name="link">
         <collision name="collision">
-          <geometry><box><size>0.1 10.0 1.0</size></box></geometry>
+          <geometry><box><size>0.1 5.0 1.0</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.1 10.0 1.0</size></box></geometry>
+          <geometry><box><size>0.1 5.0 1.0</size></box></geometry>
           <material><ambient>0.5 0.5 0.5 1</ambient></material>
         </visual>
       </link>
@@ -138,13 +138,13 @@
     <!-- 서쪽 벽 -->
     <model name="wall_west">
       <static>true</static>
-      <pose>-5.0 0 0.5 0 0 0</pose>
+      <pose>-2.5 0 0.5 0 0 0</pose>
       <link name="link">
         <collision name="collision">
-          <geometry><box><size>0.1 10.0 1.0</size></box></geometry>
+          <geometry><box><size>0.1 5.0 1.0</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.1 10.0 1.0</size></box></geometry>
+          <geometry><box><size>0.1 5.0 1.0</size></box></geometry>
           <material><ambient>0.5 0.5 0.5 1</ambient></material>
         </visual>
       </link>

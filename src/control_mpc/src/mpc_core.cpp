@@ -176,6 +176,14 @@ void MpcCore::linearize(
 }
 
 // ============================================================
+// setObstacles() — 장애물 목록 설정
+// ============================================================
+void MpcCore::setObstacles(const std::vector<Obstacle> & obstacles)
+{
+  obstacles_ = obstacles;
+}
+
+// ============================================================
 // buildQP() — P, q, A, l, u 행렬 조립
 //
 //   z = [x_0, ..., x_N, u_0, ..., u_{N-1}]
@@ -473,6 +481,92 @@ void MpcCore::buildQP(
   }
   // 여기까지 오면 row = nc_ (전체 제약 수)
   // 즉 A 행렬이 빈틈 없이 꽉 채워진 상태
+
+  // === 5. 장애물 Soft Penalty (q_vec 선형 항에 gradient 추가) ===
+  // [설계 원리]
+  //   Hard constraint (등식/부등식 제약)로 장애물을 막으면 QP가 infeasible해질 수 있음.
+  //   대신 장애물에 가까워질수록 비용이 커지는 penalty를 q_vec에 추가 (Soft Constraint).
+  //  제약으로 막는것이 아닌 가까워질수록 비용이 비싸지게 만드는 것
+  //
+  //   penalty = w * max(0, d_safe - d)²
+  //   → d가 d_safe보다 작을 때만 penalty 발생
+  //   → d가 0에 가까울수록 penalty가 제곱으로 폭증 → 강하게 밀어냄
+  //  d_eff   = 로봇과 장애물 표면 사이의 실제 거리
+  //  d_safe  = penalty가 시작되는 안전 거리 (0.6m)
+  //  violation = d_safe - d_eff   → "얼마나 안전 구역을 침범했나"
+  //
+  //   penalty의 x_k에 대한 gradient를 q_vec에 추가:
+  //   ∂penalty/∂x_k = -2w * violation * (px - ox) / d
+  //   ∂penalty/∂y_k = -2w * violation * (py - oy) / d
+  //   (linearization point x_ref[k]에서 계산)
+
+  // 즉, OSQP가 q_vec를 포함한 QP를 풀면서
+  //  waypoint 추종 + 장애물 회피를 동시에 고려한 최적 경로 계산
+
+  // === 5. 장애물 Soft Penalty ===
+  // x_ref[k] 대신 x_ref[k]와 x0를 forward simulation한
+  // 예측 상태를 기준으로 gradient 계산
+  // x_sim은 로봇이 갈 예측 위치
+
+  // 전체 구조 요약하면
+  //    x_sim = x0 (현재 위치)
+  //  for k = 1 to N:
+  //    x_sim으로 k스텝 후 예측 위치 계산
+  //    for each obstacle:
+  //      d_eff = dist(x_sim, obs) - obs.radius
+  //      violation = 0.6 - d_eff
+  //      if violation > 0:  ← 안전 거리 침범했을 때만
+  //        grad_x = -2 * 200 * violation * (x_sim-ox)/d
+  //        grad_y = -2 * 200 * violation * (x_sim-oy)/d
+  //        q_vec[k].x += grad_x  ← 장애물 반대 방향으로 밀어냄
+  //        q_vec[k].y += grad_y
+  //    x_sim = forward_kinematics(x_sim)  ← 다음 스텝 위치 갱신
+
+  StateVec x_sim = x0;  // 현재 상태에서 forward simulation
+  for (int k = 1; k <= N; ++k) {
+    // x_ref[k]로 nominal 입력 추정 후 한 스텝 예측
+    // (간단히 x_ref[k]를 예측 위치로 사용하되,
+    //  gradient는 x_sim 기준으로 계산)
+    const double px = x_sim(0);
+    const double py = x_sim(1);
+    int idx = k * NX;
+
+    for (const auto & obs : obstacles_) {
+      double dx   = px - obs.x;
+      double dy   = py - obs.y;
+      double d    = std::sqrt(dx * dx + dy * dy);
+      double d_eff = std::max(d - obs.radius, 1e-6);
+
+      double violation = params_.obs_safe_dist - d_eff;
+      if (violation <= 0.0) {
+        // forward simulation 계속 (penalty 없어도 위치는 갱신)
+        // x_sim = "k스텝 후 로봇이 실제로 있을 예측 위치"
+        // 이 위치 기준으로 장애물까지 거리/방향 계산 
+        // Forward Kinematics 로 현재 속도(v,w)를 그래도 유지한다고 가정하고 k 스탭 후 위치를 시뮬레이션
+        // 로봇이 실제로 장애물에 가까워지는 스탭에서만 패널티 발동
+        x_sim(0) += x_sim(3) * std::cos(x_sim(2)) * params_.dt;
+        x_sim(1) += x_sim(3) * std::sin(x_sim(2)) * params_.dt;
+        x_sim(2) += x_sim(4) * params_.dt;
+        continue;
+      }
+
+      double d_raw = std::max(d, 1e-6);
+      //  ∂penalty/∂x_k = -2w * violation * (px - ox) / d
+      //  ∂penalty/∂y_k = -2w * violation * (py - oy) / d\
+      //  이것을 q_vec에 더하면 장애물 반대 방향으로 미는 힘이 비용함수에 추가
+      //  방향 벡터 (px - ox, py - oy)는 로봇에서 장애물을 향하는벡터. 부호가 -이므로 장애물과 멀어지는 방향으로 밈
+      double grad_x = -2.0 * params_.obs_weight * violation * (dx / d_raw);
+      double grad_y = -2.0 * params_.obs_weight * violation * (dy / d_raw);
+      // q_vec: 어느 방향으로 당기거나 밀 것인가를 결정
+      q_vec_(idx + 0) += grad_x;
+      q_vec_(idx + 1) += grad_y;
+    }
+
+    // forward simulation으로 다음 예측 위치 갱신
+    x_sim(0) += x_sim(3) * std::cos(x_sim(2)) * params_.dt;
+    x_sim(1) += x_sim(3) * std::sin(x_sim(2)) * params_.dt;
+    x_sim(2) += x_sim(4) * params_.dt;
+  }
 
   (void)u_prev;   // 향후 입력 연속성 제약 확장 시 사용 예정
 }

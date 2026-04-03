@@ -53,6 +53,16 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
     "MPC initialized: N=%d, dt=%.3f, traj=%s",
     mpc_params_.N, mpc_params_.dt, trajectory_type_.c_str());
 
+  // W8: 장애물 설정 (simple_room.sdf 기준)
+  // obstacle_1: (1.0, 0.5), 크기 0.3×0.3 → 반경 0.15 + 로봇 반경 0.2 = 0.35
+  // obstacle_2: (-1.0, -0.5), 크기 0.3×0.3 → 반경 0.35
+  obstacles_ = {
+    {1.0,   0.5,  0.35},
+    {-1.0, -0.5,  0.35}
+  };
+  mpc_core_.setObstacles(obstacles_);
+  RCLCPP_INFO(this->get_logger(), "W8: 장애물 %zu개 설정 완료", obstacles_.size());
+
   // --- Waypoint 초기화 ---
   initWaypoints();
 
@@ -80,6 +90,15 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
 
   latency_pub_ = this->create_publisher<amr_msgs::msg::ControlLatency>(
     "/metrics/control_latency_ms", rclcpp::QoS(10).reliable());
+
+  // tracking_rmse_node가 구독할 목표 지점 토픽
+  // MPC가 현재 추종하려는 x_ref[0]을 map frame PoseStamped로 발행
+  ref_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(
+    "/mpc/reference_pose", rclcpp::QoS(10).reliable());
+
+  // W8: 최소 장애물 거리 발행
+  min_dist_pub_ = this->create_publisher<amr_msgs::msg::MinObstacleDistance>(
+    "/metrics/min_obstacle_distance", rclcpp::QoS(10).reliable());
 
   // --- 50Hz 제어 타이머 ---
   // dt = 20ms 주기로 controlCallback() 호출
@@ -124,6 +143,20 @@ void MpcNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
   x0_(4) = msg->twist.twist.angular.z;
 
   has_odom_ = true;
+
+  // 첫 odom 수신 시 waypoint 재초기화 (로봇 실제 시작 위치 반영)
+  // if (!has_odom_) {
+  //   has_odom_ = true;
+  //   init_waypoint_timer_ = this->create_wall_timer(
+  //       std::chrono ::milliseconds(500),
+  //       [this]()
+  //       {
+  //         initWaypoints();
+  //         init_waypoint_timer_->cancel();
+  //       });
+    
+  //   return;
+  // }
 }
 
 // ============================================================
@@ -205,6 +238,27 @@ void MpcNode::controlCallback()
   // 현재 위치(x0_)가 아닌 '예측된 미래 위치(x_pred)'를 기준으로 목표 궤적을 깎음
   std::vector<StateVec> x_ref = generateReference(x_pred);
 
+  // x_ref[0] = MPC가 현재 스텝에서 추종하려는 목표 상태 [x,y,θ, v, ω], 이것을 PoseStamped로 변환
+  // x_ref[0]을 /mpc/reference_pose로 발행 (tracking_rmse_node용)
+  // 왜 x_ref[0]인가? x_ref는 N+1개(현재~N스텝 후)의 목표 시퀀스인데, 현재 스텝에서 로봇이 있어야 할 
+  // 위치는 x_ref[0]. "지금 이 순간의 목표"를 비교 기준으로 삼는 것.
+  {
+    geometry_msgs::msg::PoseStamped ref_msg;
+    ref_msg.header.stamp    = this->now();
+    ref_msg.header.frame_id = "map"; // map 프레임 기준
+    ref_msg.pose.position.x = x_ref[0](0); // 목표 X
+    ref_msg.pose.position.y = x_ref[0](1); // 목표 Y
+    ref_msg.pose.position.z = 0.0;
+    // 2D 평면이므로 roll=pitch=0, yaw=θ 만 사용
+    // quaternion = (0, 0, sin(θ/2), cos(θ/2))
+    double half_yaw = x_ref[0](2) * 0.5;
+    ref_msg.pose.orientation.x = 0.0;
+    ref_msg.pose.orientation.y = 0.0;
+    ref_msg.pose.orientation.z = std::sin(half_yaw);
+    ref_msg.pose.orientation.w = std::cos(half_yaw);
+    ref_pose_pub_->publish(ref_msg);
+  }
+
   // --- 2. MPC solve ---
   // 최적화 시작점도 '미래 위치'로 설정합니다.
   MpcSolution sol = mpc_core_.solve(x_pred, x_ref, u_prev_);
@@ -264,6 +318,26 @@ void MpcNode::controlCallback()
   lat_msg.max_latency_ms = max_ms;
   latency_pub_->publish(lat_msg);
 
+  // W8: 현재 위치(x0_)에서 각 장애물까지 최소 거리 계산 및 발행
+  {
+    double min_dist = 1e9;
+    for (const auto & obs : obstacles_) {
+      double dx = x0_(0) - obs.x;
+      double dy = x0_(1) - obs.y;
+      double clearance = std::sqrt(dx * dx + dy * dy) - obs.radius;
+      min_dist = std::min(min_dist, clearance);
+    }
+    amr_msgs::msg::MinObstacleDistance dist_msg;
+    dist_msg.min_distance_m = min_dist;
+    min_dist_pub_->publish(dist_msg);
+
+    // 경고: 안전 거리(0.2m) 이내 진입 시 로그
+    if (min_dist < 0.2) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+        "장애물 근접! min_clearance=%.3fm", min_dist);
+    }
+  }
+
   // 주기적 터미널 로그 (1Hz)
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
     "[MPC] solve=%.2fms avg=%.2fms | v=%.3f w=%.3f | cost=%.2f",
@@ -296,7 +370,8 @@ void MpcNode::initWaypoints()
       StateVec wp;
       wp(0) = i * 0.1;   // x
       wp(1) = 0.0;       // y
-      wp(2) = 0.0;       // θ (정면)
+      // wp(1) = x0_(1); // 로봇 초기 y 위치로 맞춤
+      wp(2) = 0.0;     // θ (정면)
       wp(3) = 0.3;     // v
       wp(4) = 0.0;       // ω
       waypoints_.push_back(wp);

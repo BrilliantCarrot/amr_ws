@@ -32,8 +32,10 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <amr_msgs/msg/control_latency.hpp>
 #include <amr_msgs/msg/localization_status.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>   // x_ref[0] → /mpc/reference_pose 발행용
 
 #include "control_mpc/mpc_core.hpp"
+#include "amr_msgs/msg/min_obstacle_distance.hpp" // w8 min clearance 발행용
 
 namespace control_mpc
 {
@@ -132,6 +134,17 @@ private:
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr           cmd_vel_pub_;
   rclcpp::Publisher<amr_msgs::msg::ControlLatency>::SharedPtr       latency_pub_;
   rclcpp::TimerBase::SharedPtr                                      control_timer_;
+  
+  // W8 추가: tracking_rmse_node가 구독하는 현재 목표 지점 발행 publisher
+  // x_ref[0] (map frame) → geometry_msgs/PoseStamped 형태로 발행
+  // pose_rmse_node      : EKF 추정값 vs GT → "추정기가 얼마나 정확한가"
+  // tracking_rmse_node  : MPC 목표 지점 vs GT → "제어기가 경로를 얼마나 잘 따라가는가"
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr         ref_pose_pub_;
+
+  // W8: 최소 장애물 거리 발행 publisher
+  rclcpp::Publisher<amr_msgs::msg::MinObstacleDistance>::SharedPtr min_dist_pub_;
+  // W8: 장애물 목록 (map frame 기준, 생성자에서 설정)
+  std::vector<Obstacle> obstacles_;
 
   // --- MPC 핵심 객체 ---
   MpcCore mpc_core_;

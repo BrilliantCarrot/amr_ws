@@ -3,6 +3,9 @@ build/
 install/
 log/
 bags/
+*.data
+*.posegraph
+*.yaml
 
 # Python 관련
 __pycache__/

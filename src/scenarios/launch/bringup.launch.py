@@ -71,7 +71,7 @@ def launch_setup(context, *args, **kwargs):
                     '--timeout', '5000',
                     '--req',
                     f'sdf_filename: "{sdf_out}", name: "amr_robot", '
-                    f'pose: {{position: {{x: 0, y: 0, z: 0.3}}}}'
+                    f'pose: {{position: {{x: 0, y: 0.0, z: 0.3}}}}'
                 ],
                 output='screen'
             )
