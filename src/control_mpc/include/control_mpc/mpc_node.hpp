@@ -33,7 +33,7 @@
 #include <amr_msgs/msg/control_latency.hpp>
 #include <amr_msgs/msg/localization_status.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>   // x_ref[0] → /mpc/reference_pose 발행용
-
+#include <amr_msgs/msg/obstacle_array.hpp>
 #include "control_mpc/mpc_core.hpp"
 #include "amr_msgs/msg/min_obstacle_distance.hpp" // w8 min clearance 발행용
 
@@ -146,6 +146,10 @@ private:
   // W8: 장애물 목록 (map frame 기준, 생성자에서 설정)
   std::vector<Obstacle> obstacles_;
 
+  // 클래스 private 멤버 영역에 추가
+  rclcpp::Subscription<amr_msgs::msg::ObstacleArray>::SharedPtr obs_sub_;
+  void obsCallback(const amr_msgs::msg::ObstacleArray::SharedPtr msg);
+
   // --- MPC 핵심 객체 ---
   MpcCore mpc_core_;
 
@@ -162,6 +166,7 @@ private:
   std::vector<StateVec> waypoints_;
   int   closest_wp_idx_ = 0;     // 현재 가장 가까운 waypoint 인덱스
   bool  mission_done_   = false;  // 마지막 waypoint 도달 여부
+  // bool waypoints_rerouted_ = false;  // rerouteWaypointsAroundObstacles 중복 실행 방지
 
   // --- Localization 상태 캐시 ---
   uint8_t loc_status_ = 0;   // 0=NORMAL, 1=DEGRADED, 2=LOST
@@ -183,6 +188,11 @@ private:
   // --- latency 통계 ---
   // 99th percentile 계산을 위해 최근 solve time을 저장
   std::vector<double> latency_history_;
+
+  // // W9: 정적 장애물 회피를 위한 x_ref 측방 이동
+  // void shiftReferenceAroundObstacles(std::vector<StateVec> & x_ref);
+
+  // void rerouteWaypointsAroundObstacles();
 
   double prev_raw_theta_    = 0.0;   // 직전 raw atan2 yaw 값 (래핑 delta 계산용)
   double continuous_theta_  = 0.0;   // 누적 연속 yaw (래핑 없는 절대값)

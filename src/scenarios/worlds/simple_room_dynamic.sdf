@@ -1,0 +1,199 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+  <!-- ================================================================
+       simple_room_dynamic.sdf — W9 동적 장애물 시나리오 월드
+
+       [설계 변경 이력]
+         v1: actor type="__default__" → Fortress에서 type 속성 필수 오류
+         v2: static model + z=-3.0 지하 배치
+             → Gazebo SceneBroadcaster 씬 전송 실패 (entity tree 빈 상태)
+         v3: 지하 배치 완전 폐기
+             → sudden_obs를 남쪽 벽 바깥(y=-3.0, z=0.4)에 배치
+             → t=8s에 obstacle_controller_node가 y=0.0으로 이동
+             → LiDAR 입장: 벽에 가려져 있다가 갑자기 출현 = 돌발 효과 동일
+
+       [동작 원리]
+         모든 모델 지상 배치 → SceneBroadcaster 정상 동작
+         obstacle_controller_node.py가 5Hz로 ign service set_pose 호출
+         UserCommands 플러그인이 ECM Pose 컴포넌트 직접 수정
+
+       [장애물 구성]
+         dyn_obs_1  (초록): x=0.5 고정, y축 왕복 0.30 m/s — 초반 경로 횡단
+         dyn_obs_2  (파란): x=1.5 고정, y축 왕복 0.16 m/s — 중반 경로 횡단
+         sudden_obs (노랑): 남쪽 벽 밖 대기 → t=8s에 경로 정면 순간 출현
+
+       ⚠️ world name="simple_room" 유지 필수
+       사용: ros2 launch scenarios bringup.launch.py world:=simple_room_dynamic
+       ================================================================ -->
+  <world name="simple_room">
+
+    <!-- 물리 엔진 -->
+    <physics name="default_physics" type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- 시스템 플러그인 -->
+    <plugin filename="libignition-gazebo-physics-system.so"
+            name="ignition::gazebo::systems::Physics"/>
+    <plugin filename="libignition-gazebo-sensors-system.so"
+            name="ignition::gazebo::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="libignition-gazebo-scene-broadcaster-system.so"
+            name="ignition::gazebo::systems::SceneBroadcaster"/>
+    <!-- UserCommands: /world/simple_room/set_pose 서비스 제공
+         obstacle_controller_node.py가 이 서비스로 pose 갱신 -->
+    <plugin filename="libignition-gazebo-user-commands-system.so"
+            name="ignition::gazebo::systems::UserCommands"/>
+    <plugin filename="libignition-gazebo-imu-system.so"
+            name="ignition::gazebo::systems::Imu"/>
+
+    <!-- 조명 -->
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>1 1 1 1</diffuse>
+      <specular>0.5 0.5 0.5 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- 바닥 -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane>
+            <normal>0 0 1</normal>
+            <size>20 20</size>
+          </plane></geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 벽 4개 (5m x 5m 방) -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 2.5 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>5 0.1 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>5 0.1 1.0</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -2.5 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>5 0.1 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>5 0.1 1.0</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_east">
+      <static>true</static>
+      <pose>2.5 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.1 5 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.1 5 1.0</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-2.5 0 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.1 5 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.1 5 1.0</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 정적 장애물 2개 (W8 MPC Soft Penalty 호환) -->
+    <model name="obstacle_1">
+      <static>true</static>
+      <pose>1.0 0.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.3 0.3 0.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 0.3 0.5</size></box></geometry>
+          <material><ambient>0.8 0.2 0.2 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="obstacle_2">
+      <static>true</static>
+      <pose>-1.0 -0.5 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.3 0.3 0.5</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 0.3 0.5</size></box></geometry>
+          <material><ambient>0.8 0.2 0.2 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ================================================================
+         동적 장애물 — dyn_obs_1 (초록)
+         초기: x=0.5, y=-1.5, z=0.4 (지상, y축 왕복 출발점)
+         움직임: obstacle_controller_node.py가 5Hz로 갱신
+         ================================================================ -->
+    <model name="dyn_obs_1">
+      <static>true</static>
+      <pose>0.5 -1.5 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.3 0.3 0.8</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 0.3 0.8</size></box></geometry>
+          <material>
+            <ambient>0.8 0.2 0.2 1</ambient>
+            <diffuse>0.8 0.2 0.2 1</diffuse>
+            <specular>0.1 0.1 0.1 1</specular>
+            <emissive>0.3 0.0 0.0 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+
+
+
+
+
+    
+
+  </world>
+</sdf>

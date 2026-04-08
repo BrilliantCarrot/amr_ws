@@ -58,6 +58,8 @@ struct Obstacle {
   double x;       // 장애물 중심 x [m] (map frame)
   double y;       // 장애물 중심 y [m] (map frame)
   double radius;  // 장애물 반경 [m] (크기의 절반 + 로봇 반경)
+  double vx = 0.0;
+  double vy = 0.0;
 };
 
 // ============================================================
@@ -76,8 +78,8 @@ struct MpcParams
   double q_w   = 1.0;    // 각속도 오차 가중치  [1/(rad/s)²]
 
   // R: 입력 페널티 (클수록 smooth, 단위 없음 — 입력²에 곱하는 가중치)
-  double r_dv  = 10.0;   // Δv 페널티  [1/(m/s)²]   → 속도 변화 1m/s당 10 페널티
-  double r_dw  = 5.0;    // Δω 페널티  [1/(rad/s)²] → 각속도 변화 1rad/s당 5 페널티
+  double r_dv  = 30.0;   // Δv 페널티  [1/(m/s)²]   → 속도 변화 1m/s당 10 페널티
+  double r_dw  = 2.0;    // Δω 페널티  [1/(rad/s)²] → 각속도 변화 1rad/s당 5 페널티
 
   // 상태 제약
   double v_max  =  0.5;  // 최대 선속도   [m/s]
@@ -92,8 +94,8 @@ struct MpcParams
   double dw_min = -0.2;  // 최소 각속도 변화량  [rad/s per step]
 
   // W8: 장애물 soft penalty 파라미터
-  double obs_weight    = 200.0;  // 장애물 penalty 가중치 (클수록 강하게 회피)
-  double obs_safe_dist =  0.6;   // penalty 시작 거리 [m] (이 이내로 들어오면 penalty 발생)
+  double obs_weight    = 50.0;  // 장애물 penalty 가중치 (클수록 강하게 회피)
+  double obs_safe_dist =  0.45;   // penalty 시작 거리 [m] (이 이내로 들어오면 penalty 발생)
 };
 
 // ============================================================

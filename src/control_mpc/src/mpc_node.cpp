@@ -23,16 +23,20 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("q_th",       5.0);
   this->declare_parameter("q_v",        1.0);
   this->declare_parameter("q_w",        1.0);
-  this->declare_parameter("r_dv",       10.0);
-  this->declare_parameter("r_dw",       5.0);
+  this->declare_parameter("r_dv",       30.0);
+  this->declare_parameter("r_dw",       20.0);
   this->declare_parameter("v_max",      0.5);
   this->declare_parameter("v_min",     -0.5);
   this->declare_parameter("w_max",      1.0);
   this->declare_parameter("w_min",     -1.0);
-  this->declare_parameter("dv_max",     0.1);
+  this->declare_parameter("dv_max",     0.3);
   this->declare_parameter("dv_min",    -0.1);
   this->declare_parameter("dw_max",     0.2);
   this->declare_parameter("dw_min",    -0.2);
+
+  // 장애물 관련 파라미터 (없다면 추가 선언)
+  this->declare_parameter("obs_weight", 30.0);    // 기존 200.0 -> 50.0으로 수정
+  this->declare_parameter("obs_safe_dist", 0.4);  // 기존 0.6 -> 0.4로 수정
 
   // 경로 관련 파라미터
   this->declare_parameter("trajectory_type", std::string("straight"));
@@ -56,12 +60,12 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   // W8: 장애물 설정 (simple_room.sdf 기준)
   // obstacle_1: (1.0, 0.5), 크기 0.3×0.3 → 반경 0.15 + 로봇 반경 0.2 = 0.35
   // obstacle_2: (-1.0, -0.5), 크기 0.3×0.3 → 반경 0.35
-  obstacles_ = {
-    {1.0,   0.5,  0.35},
-    {-1.0, -0.5,  0.35}
-  };
-  mpc_core_.setObstacles(obstacles_);
-  RCLCPP_INFO(this->get_logger(), "W8: 장애물 %zu개 설정 완료", obstacles_.size());
+  // obstacles_ = {
+  //   {1.0,   0.5,  0.35},
+  //   {-1.0, -0.5,  0.35}
+  // };
+  // mpc_core_.setObstacles(obstacles_);
+  // RCLCPP_INFO(this->get_logger(), "W8: 장애물 %zu개 설정 완료", obstacles_.size());
 
   // --- Waypoint 초기화 ---
   initWaypoints();
@@ -83,6 +87,13 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   loc_sub_ = this->create_subscription<amr_msgs::msg::LocalizationStatus>(
     "/localization/status", qos_reliable,
     std::bind(&MpcNode::locStatusCallback, this, std::placeholders::_1));
+
+    // 생성자에 추가 (qos_reliable 설정 부분 근처)
+  obs_sub_ = this->create_subscription<amr_msgs::msg::ObstacleArray>(
+    "/obstacles/detected", rclcpp::QoS(10).reliable(),
+    std::bind(&MpcNode::obsCallback, this, std::placeholders::_1));
+
+  RCLCPP_INFO(this->get_logger(), "W9: Obstacle Tracker 구독 시작"); // 확인용 로그 추가
 
   // --- publisher ---
   cmd_vel_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
@@ -173,6 +184,29 @@ void MpcNode::locStatusCallback(
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "Localization LOST — MPC 정지 명령 발행 중");
   }
+}
+
+// 소스 하단에 콜백 함수 구현
+void MpcNode::obsCallback(const amr_msgs::msg::ObstacleArray::SharedPtr msg)
+{
+  constexpr double ROBOT_RADIUS = 0.2;
+  obstacles_.clear();
+  for (int i = 0; i < msg->count; ++i) {
+    Obstacle obs;
+    obs.x = msg->x[i];
+    obs.y = msg->y[i];
+    obs.radius = msg->radius[i] + ROBOT_RADIUS;
+    obs.vx = msg->vx[i];
+    obs.vy = msg->vy[i];
+    obstacles_.push_back(obs);
+  }
+  mpc_core_.setObstacles(obstacles_);
+
+  // 디버깅: 수신된 장애물 개수가 0보다 클 때만 출력
+  if (!obstacles_.empty()) {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
+      "장애물 %zu개 수신 중...", obstacles_.size());
+  } 
 }
 
 // ============================================================
@@ -287,6 +321,25 @@ void MpcNode::controlCallback()
 
   // 물리적 한계치 클리핑 (파라미터 제약 준수)
   v_cmd = std::clamp(v_cmd, mpc_params_.v_min, mpc_params_.v_max);
+
+  // 장애물 거리 기반 속도 스케일링
+  // obs_safe_dist(0.6m) 이내로 들어오면 속도를 점진적으로 줄임
+  // v_min_ratio=0.3: 최소 30% 속도는 보장 (정지 방지)
+  if (!obstacles_.empty()) {
+    double min_dist = 1e9;
+    for (const auto & obs : obstacles_) {
+      double d = std::hypot(x0_(0)-obs.x, x0_(1)-obs.y) - obs.radius;
+      min_dist = std::min(min_dist, d);
+    }
+    constexpr double slow_start = 0.5;  // 감속 시작 거리 [m]
+    constexpr double v_min_ratio = 0.3; // 최소 속도 비율 (30%)
+    if (min_dist < slow_start && v_cmd > 0.0) {
+      // double scale = std::max(min_dist / slow_start, v_min_ratio);
+      // v_cmd *= scale;
+      v_cmd = std::max(v_cmd, 0.2);
+    }
+  }
+
   w_cmd = std::clamp(w_cmd, mpc_params_.w_min, mpc_params_.w_max);
 
   // --- 4. /cmd_vel 발행 (큐를 통해 지연 발행됨) ---
@@ -332,7 +385,7 @@ void MpcNode::controlCallback()
     min_dist_pub_->publish(dist_msg);
 
     // 경고: 안전 거리(0.2m) 이내 진입 시 로그
-    if (min_dist < 0.2) {
+    if (min_dist < -0.2) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
         "장애물 근접! min_clearance=%.3fm", min_dist);
     }
@@ -664,6 +717,9 @@ MpcParams MpcNode::loadMpcParams()
   p.dv_min = this->get_parameter("dv_min").as_double();
   p.dw_max = this->get_parameter("dw_max").as_double();
   p.dw_min = this->get_parameter("dw_min").as_double();
+  // W8/W9 추가 파라미터 로드 확인
+  p.obs_weight = this->get_parameter("obs_weight").as_double();
+  p.obs_safe_dist = this->get_parameter("obs_safe_dist").as_double();
   return p;
 }
 

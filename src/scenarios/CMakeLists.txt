@@ -24,4 +24,9 @@ install(
   DESTINATION share/${PROJECT_NAME}/config
 )
 
+install(PROGRAMS
+  scripts/obstacle_controller_node.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
