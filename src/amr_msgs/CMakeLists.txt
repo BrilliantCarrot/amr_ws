@@ -15,6 +15,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/MinObstacleDistance.msg"
   "msg/LocalizationStatus.msg"
   "msg/ObstacleArray.msg"
+  "msg/SafetyStatus.msg"       # W10 Step1: /safety/state 토픽용
+  "msg/WatchdogEvent.msg"      # W10 Step2: /safety/watchdog_event 토픽용
   DEPENDENCIES std_msgs
 )
 

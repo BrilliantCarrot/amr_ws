@@ -25,14 +25,15 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("q_w",        1.0);
   this->declare_parameter("r_dv",       30.0);
   this->declare_parameter("r_dw",       20.0);
-  this->declare_parameter("v_max",      0.5);
-  this->declare_parameter("v_min",     -0.5);
+  this->declare_parameter("v_max",      0.15); // 로봇 최대 선속도
+  this->declare_parameter("v_min",     -0.1); // 로봇 최소 선속도
   this->declare_parameter("w_max",      1.0);
   this->declare_parameter("w_min",     -1.0);
   this->declare_parameter("dv_max",     0.3);
   this->declare_parameter("dv_min",    -0.1);
   this->declare_parameter("dw_max",     0.2);
   this->declare_parameter("dw_min",    -0.2);
+  this->declare_parameter("v_ref_", 0.1); // 로봇 이동 선속도
 
   // 장애물 관련 파라미터 (없다면 추가 선언)
   this->declare_parameter("obs_weight", 30.0);    // 기존 200.0 -> 50.0으로 수정
@@ -43,6 +44,7 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("goal_tolerance",  0.15);
   this->declare_parameter("delay_ms",        0.0); // 기본값은 지연 없음
   this->declare_parameter("slip_ratio",      0.0); // 기본값은 슬립 없음
+  this->declare_parameter("artificial_load_ms", 0.0); // 기본 cpu 부하는 없음
 
   // 파라미터 로드
   mpc_params_       = loadMpcParams();
@@ -50,6 +52,26 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   goal_tolerance_   = this->get_parameter("goal_tolerance").as_double();
   delay_ms_         = this->get_parameter("delay_ms").as_double();
   slip_ratio_       = this->get_parameter("slip_ratio").as_double();
+  artificial_load_ms_ = this->get_parameter("artificial_load_ms").as_double();
+
+  // 런타임 파라미터 변경 콜백
+  // ros2 param set으로 변경 시 즉시 멤버변수에 반영
+  param_cb_handle_ = this->add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & params)
+    -> rcl_interfaces::msg::SetParametersResult
+    {
+      for (const auto & p : params) {
+        if (p.get_name() == "artificial_load_ms")
+          artificial_load_ms_ = p.as_double();
+        else if (p.get_name() == "drop_rate")
+          slip_ratio_ = p.as_double();
+      }
+      rcl_interfaces::msg::SetParametersResult result;
+      result.successful = true;
+      return result;
+    });
+
+  v_ref_ = this->get_parameter("v_ref_").as_double();
 
   // --- MPC 초기화 ---
   mpc_core_.init(mpc_params_);
@@ -73,25 +95,35 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   // --- 상태 초기화 ---
   x0_.setZero();
   u_prev_.setZero();
-  loc_status_ = 0;
+  loc_status_ = 0; // 추후 삭제 가능
 
   // --- subscriber ---
   // /map_ekf/odom: map frame 기준 fused pose (W5에서 완성)
   // RELIABLE QoS — MPC 입력이므로 손실 없이 받아야 함
+
+  sensor_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  control_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  auto sensor_opt = rclcpp::SubscriptionOptions();
+  sensor_opt.callback_group = sensor_cb_group_;
+
   auto qos_reliable = rclcpp::QoS(10).reliable();
 
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
     "/map_ekf/odom", qos_reliable,
-    std::bind(&MpcNode::odomCallback, this, std::placeholders::_1));
+    std::bind(&MpcNode::odomCallback, this, std::placeholders::_1), sensor_opt);
 
   loc_sub_ = this->create_subscription<amr_msgs::msg::LocalizationStatus>(
     "/localization/status", qos_reliable,
-    std::bind(&MpcNode::locStatusCallback, this, std::placeholders::_1));
+    std::bind(&MpcNode::locStatusCallback, this, std::placeholders::_1), sensor_opt);
 
     // 생성자에 추가 (qos_reliable 설정 부분 근처)
   obs_sub_ = this->create_subscription<amr_msgs::msg::ObstacleArray>(
     "/obstacles/detected", rclcpp::QoS(10).reliable(),
-    std::bind(&MpcNode::obsCallback, this, std::placeholders::_1));
+    std::bind(&MpcNode::obsCallback, this, std::placeholders::_1), sensor_opt);
+
+  safety_sub_ = this->create_subscription<amr_msgs::msg::SafetyStatus>(
+  "/safety/state", qos_reliable,
+  std::bind(&MpcNode::safetyStateCallback, this, std::placeholders::_1), sensor_opt);
 
   RCLCPP_INFO(this->get_logger(), "W9: Obstacle Tracker 구독 시작"); // 확인용 로그 추가
 
@@ -115,7 +147,7 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   // dt = 20ms 주기로 controlCallback() 호출
   control_timer_ = this->create_wall_timer(
     std::chrono::milliseconds(static_cast<int>(mpc_params_.dt * 1000)),
-    std::bind(&MpcNode::controlCallback, this));
+    std::bind(&MpcNode::controlCallback, this), control_cb_group_);
 
   RCLCPP_INFO(this->get_logger(), "MpcNode started. Waiting for /map_ekf/odom...");
 }
@@ -128,6 +160,8 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
 
 void MpcNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
   // 위치: map frame 기준
   x0_(0) = msg->pose.pose.position.x;
   x0_(1) = msg->pose.pose.position.y;
@@ -154,6 +188,7 @@ void MpcNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
   x0_(4) = msg->twist.twist.angular.z;
 
   has_odom_ = true;
+  last_odom_stamp_ = this->get_clock()->now();
 
   // 첫 odom 수신 시 waypoint 재초기화 (로봇 실제 시작 위치 반영)
   // if (!has_odom_) {
@@ -171,12 +206,14 @@ void MpcNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
 }
 
 // ============================================================
-// locStatusCallback() — /localization/status 수신 (10Hz)
+// locStatusCallback() — /localization/status 수신 (10Hz), 추후 삭제
 // ============================================================
 
 void MpcNode::locStatusCallback(
   const amr_msgs::msg::LocalizationStatus::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
   loc_status_ = msg->status;
 
   // LOST 상태 경고
@@ -186,9 +223,19 @@ void MpcNode::locStatusCallback(
   }
 }
 
+void MpcNode::safetyStateCallback(
+  const amr_msgs::msg::SafetyStatus::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
+  safety_state_ = msg->state;
+}
+
 // 소스 하단에 콜백 함수 구현
 void MpcNode::obsCallback(const amr_msgs::msg::ObstacleArray::SharedPtr msg)
 {
+  std::lock_guard<std::mutex> lock(state_mutex_);
+
   constexpr double ROBOT_RADIUS = 0.2;
   obstacles_.clear();
   for (int i = 0; i < msg->count; ++i) {
@@ -221,22 +268,53 @@ void MpcNode::obsCallback(const amr_msgs::msg::ObstacleArray::SharedPtr msg)
 //   6. latency 발행
 // ============================================================
 
+// ============================================================
+// controlCallback() — 50Hz 제어 루프
+//
+//   매 20ms마다 실행:
+//   1. Data Copy-out: 뮤텍스 락을 최소한으로 유지하여 상태 복사
+//   2. 상태 예측 지연 보상 (Delay Compensation)
+//   3. reference trajectory 생성
+//   4. MPC solve (무거운 연산 시 락 해제 상태 유지)
+//   5. u0 → v, ω 변환 후 /cmd_vel 발행
+//   6. latency 통계 산출 및 발행
+// ============================================================
+
 void MpcNode::controlCallback()
 {
-  // 1. odom 미수신 시 대기
-  if (!has_odom_) {
+  // ----------------------------------------------------------------
+  // [수정 위치 1] Data Copy-out 기법 적용
+  // 원리: MultiThreadedExecutor 환경에서는 MPC solve(약 2~20ms 소요)가 도는 동안 
+  // 락(lock)을 쥐고 있으면 odom, loc 등 다른 콜백이 실행되지 못하고 데드락에 빠집니다.
+  // 따라서 아주 짧은 시간 동안만 락을 걸어 공유 자원(멤버 변수)을 로컬 변수로 복사한 뒤,
+  // 락을 해제하고 복사된 로컬 변수로만 무거운 알고리즘 연산을 진행합니다.
+  // ----------------------------------------------------------------
+  StateVec local_x0;
+  bool local_has_odom;
+  uint8_t local_safety_state;
+  bool local_mission_done;
+  std::vector<Obstacle> local_obstacles;
+  std::deque<geometry_msgs::msg::Twist> local_delay_queue;
+  
+  { // 변수 복사를 위한 스코프(Scope) 시작
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    local_x0 = x0_;
+    local_has_odom = has_odom_;
+    local_safety_state = safety_state_;
+    local_mission_done = mission_done_;
+    local_obstacles = obstacles_;
+    local_delay_queue = delay_queue_;
+  } // 스코프 종료와 동시에 락이 해제되어 센서 콜백들이 정상 동작할 수 있습니다.
+
+  // 멤버 변수 대신 복사해 온 로컬 변수로 상태를 체크합니다.
+  if (!local_has_odom) {
     return;
   }
-
-  // 2. Localization LOST 시 즉시 정지 및 루프 탈출
-  if (loc_status_ == 2) {
+  if (local_safety_state == 2){
     publishStop();
     return;
   }
-
-  // 3. 미션 완료 시 정지 명령 유지 및 제어 루프 완전 차단
-  // (이 return이 없으면 목표점 도달 후에도 로봇이 멈추지 않고 계속 맴돌게 됩니다)
-  if (mission_done_) {
+  if (local_mission_done) {
     publishStop();
     return;
   }
@@ -244,16 +322,12 @@ void MpcNode::controlCallback()
   auto t_start = std::chrono::high_resolution_clock::now();
 
   // ----------------------------------------------------------------
-  // [지연 보상 (Delay Compensation) 로직]
-  // 큐에 대기 중인 과거의 명령들을 이용해, 지연 시간(delay_ms_) 후 
-  // 로봇이 실제로 도달해 있을 미래 위치를 물리 모델로 미리 계산
-  // 현재 상태(x0_)에서 출발하여, 큐에 쌓여있는(아직 실행 안 된) 명령들을 
-  // 운동학 모델로 미리 시뮬레이션하여 지연 시간 이후의 미래 상태를 예측함.
+  // [수정 위치 2] 변수명 치환 (x0_ -> local_x0, delay_queue_ -> local_delay_queue)
   // ----------------------------------------------------------------
-  StateVec x_pred = x0_;
-  if (delay_ms_ > 0.0 && !delay_queue_.empty()) {
+  StateVec x_pred = local_x0;
+  if (delay_ms_ > 0.0 && !local_delay_queue.empty()) {
     double dt_step = mpc_params_.dt;
-    for (const auto & msg : delay_queue_) {
+    for (const auto & msg : local_delay_queue) {
       double v = msg.linear.x;
       double w = msg.angular.z;
 
@@ -264,27 +338,18 @@ void MpcNode::controlCallback()
       x_pred(3) = v;
       x_pred(4) = w;
     }
-    // 주의: 여기서 x_pred(2)에 대해 atan2 정규화를 하지 않음
-    // EKF에서 올라온 누적 연속 Yaw 값을 그대로 유지해야 2\pi 점프에 의한 발산이 안 생깁니다.
   }
 
   // --- 1. reference trajectory 생성 ---
-  // 현재 위치(x0_)가 아닌 '예측된 미래 위치(x_pred)'를 기준으로 목표 궤적을 깎음
   std::vector<StateVec> x_ref = generateReference(x_pred);
 
-  // x_ref[0] = MPC가 현재 스텝에서 추종하려는 목표 상태 [x,y,θ, v, ω], 이것을 PoseStamped로 변환
-  // x_ref[0]을 /mpc/reference_pose로 발행 (tracking_rmse_node용)
-  // 왜 x_ref[0]인가? x_ref는 N+1개(현재~N스텝 후)의 목표 시퀀스인데, 현재 스텝에서 로봇이 있어야 할 
-  // 위치는 x_ref[0]. "지금 이 순간의 목표"를 비교 기준으로 삼는 것.
   {
     geometry_msgs::msg::PoseStamped ref_msg;
     ref_msg.header.stamp    = this->now();
-    ref_msg.header.frame_id = "map"; // map 프레임 기준
-    ref_msg.pose.position.x = x_ref[0](0); // 목표 X
-    ref_msg.pose.position.y = x_ref[0](1); // 목표 Y
+    ref_msg.header.frame_id = "map";
+    ref_msg.pose.position.x = x_ref[0](0);
+    ref_msg.pose.position.y = x_ref[0](1);
     ref_msg.pose.position.z = 0.0;
-    // 2D 평면이므로 roll=pitch=0, yaw=θ 만 사용
-    // quaternion = (0, 0, sin(θ/2), cos(θ/2))
     double half_yaw = x_ref[0](2) * 0.5;
     ref_msg.pose.orientation.x = 0.0;
     ref_msg.pose.orientation.y = 0.0;
@@ -293,14 +358,38 @@ void MpcNode::controlCallback()
     ref_pose_pub_->publish(ref_msg);
   }
 
-  // --- 2. MPC solve ---
-  // 최적화 시작점도 '미래 위치'로 설정합니다.
-  MpcSolution sol = mpc_core_.solve(x_pred, x_ref, u_prev_);
+  // ----------------------------------------------------------------
+  // [수정 위치 3] 장애물 변수 명시적 세팅
+  // MPC 코어가 사용할 장애물 정보도 복사본(local_obstacles)을 넘겨 스레드 충돌을 방지합니다.
+  // ----------------------------------------------------------------
+  mpc_core_.setObstacles(local_obstacles);
+
+  // ----------------------------------------------------------------
+  // [수정 위치 4] solve 함수 u_prev_ 분리
+  // u_prev_ 멤버 변수 역시 공유 자원이므로 잠시 락을 걸어 복사한 뒤 넘깁니다.
+  // ----------------------------------------------------------------
+  InputVec current_u_prev;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    current_u_prev = u_prev_;
+  }
+  
+  // 무거운 행렬 연산 구간입니다. 이때 락이 풀려있으므로 데드락이 발생하지 않습니다.
+  MpcSolution sol = mpc_core_.solve(x_pred, x_ref, current_u_prev);
+
+  // 인위적 CPU 부하 주입 로직
+  if (artificial_load_ms_ > 0.0) {
+    const int iterations = static_cast<int>(artificial_load_ms_);
+    Eigen::MatrixXd m = Eigen::MatrixXd::Random(50, 50);
+    for (int i = 0; i < iterations; ++i) {
+      m = m * m.transpose(); 
+      m = m / m.norm();      
+    }
+  }
 
   auto t_end = std::chrono::high_resolution_clock::now();
   double elapsed_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
 
-  // 최적해 도출 실패 시 비상 정지
   if (!sol.success) {
     RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
       "MPC solve 실패 — 정지 명령");
@@ -308,75 +397,103 @@ void MpcNode::controlCallback()
     return;
   }
 
-  // --- 3. u0 → 실제 v, ω 계산 ---
-  // u0 = [Δv, Δω] → v = v_prev + Δv, ω = ω_prev + Δω
-  double v_cmd = u_prev_(0) + sol.u0(0);
-  double w_cmd = u_prev_(1) + sol.u0(1);
+  // ----------------------------------------------------------------
+  // [수정 위치 5] 속도 계산 락 추가
+  // 결과물인 v_cmd, w_cmd를 산출할 때, 공유 자원인 u_prev_를 사용하므로 락으로 보호합니다.
+  // ----------------------------------------------------------------
+  double v_cmd, w_cmd;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    v_cmd = u_prev_(0) + sol.u0(0);
+    w_cmd = u_prev_(1) + sol.u0(1);
+  }
 
-  // DEGRADED 상태: 속도를 안전하게 50%로 제한
-  if (loc_status_ == 1) {
+  if (local_safety_state == 1){
     v_cmd *= 0.5;
     w_cmd *= 0.5;
   }
 
-  // 물리적 한계치 클리핑 (파라미터 제약 준수)
   v_cmd = std::clamp(v_cmd, mpc_params_.v_min, mpc_params_.v_max);
 
-  // 장애물 거리 기반 속도 스케일링
-  // obs_safe_dist(0.6m) 이내로 들어오면 속도를 점진적으로 줄임
-  // v_min_ratio=0.3: 최소 30% 속도는 보장 (정지 방지)
-  if (!obstacles_.empty()) {
+  // 로컬 변수(local_obstacles, local_x0)를 사용하여 거리 연산을 수행합니다.
+  if (!local_obstacles.empty()) {
     double min_dist = 1e9;
-    for (const auto & obs : obstacles_) {
-      double d = std::hypot(x0_(0)-obs.x, x0_(1)-obs.y) - obs.radius;
+    for (const auto & obs : local_obstacles) {
+      double d = std::hypot(local_x0(0)-obs.x, local_x0(1)-obs.y) - obs.radius;
       min_dist = std::min(min_dist, d);
     }
-    constexpr double slow_start = 0.5;  // 감속 시작 거리 [m]
-    constexpr double v_min_ratio = 0.3; // 최소 속도 비율 (30%)
+    constexpr double slow_start = 0.5;  
     if (min_dist < slow_start && v_cmd > 0.0) {
-      // double scale = std::max(min_dist / slow_start, v_min_ratio);
-      // v_cmd *= scale;
       v_cmd = std::max(v_cmd, 0.2);
     }
   }
 
   w_cmd = std::clamp(w_cmd, mpc_params_.w_min, mpc_params_.w_max);
 
-  // --- 4. /cmd_vel 발행 (큐를 통해 지연 발행됨) ---
+  // 내부에서 delay_queue_ 조작 시 락이 걸리도록 이미 수정된 함수입니다.
   publishCmdVel(v_cmd, w_cmd);
 
-  // 이전 입력 갱신 (다음 스텝의 Δu 계산 및 지연 보상에 사용)
-  u_prev_(0) = v_cmd;
-  u_prev_(1) = w_cmd;
+  // ----------------------------------------------------------------
+  // [수정 위치 6] 상태 저장 및 통계 갱신 락 추가
+  // 외부로 발행(Publish)할 변수들은 스코프 밖에서 미리 선언해두어야 합니다.
+  // ----------------------------------------------------------------
+  double e2e_ms = 0.0, avg_e2e = 0.0, p99_e2e = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    
+    auto now_stamp = this->get_clock()->now();
+    e2e_ms = (now_stamp - last_odom_stamp_).seconds() * 1000.0;
+    
+    e2e_history_.push_back(e2e_ms);
+    if (static_cast<int>(e2e_history_.size()) > 500) {
+      e2e_history_.erase(e2e_history_.begin());
+    }
+
+    // e2e 평균 계산
+    for (double v : e2e_history_) avg_e2e += v;
+    avg_e2e /= e2e_history_.size();
+
+    // e2e 99th percentile 계산
+    if (!e2e_history_.empty()) {
+      std::vector<double> sorted = e2e_history_;
+      std::sort(sorted.begin(), sorted.end());
+      int idx = static_cast<int>(sorted.size() * 0.99);
+      p99_e2e = sorted[std::min(idx, static_cast<int>(sorted.size()) - 1)];
+    }
+
+    // 이전 입력 갱신 (다음 스텝의 계산을 위해 저장)
+    u_prev_(0) = v_cmd;
+    u_prev_(1) = w_cmd;
+  }
 
   // --- 5. latency 통계 산출 및 발행 ---
+  // 아래 변수들은 멤버 변수가 아닌 로컬 변수이므로 락이 불필요합니다.
   latency_history_.push_back(elapsed_ms);
-
-  // 최근 500샘플(10초)만 유지
   if (static_cast<int>(latency_history_.size()) > 500) {
     latency_history_.erase(latency_history_.begin());
   }
 
-  // 평균 계산
   double avg_ms = 0.0;
   for (double v : latency_history_) avg_ms += v;
   avg_ms /= latency_history_.size();
 
-  // 최대값 계산
   double max_ms = *std::max_element(latency_history_.begin(), latency_history_.end());
 
   amr_msgs::msg::ControlLatency lat_msg;
   lat_msg.latency_ms     = elapsed_ms;
   lat_msg.avg_latency_ms = avg_ms;
   lat_msg.max_latency_ms = max_ms;
+  lat_msg.e2e_latency_ms = e2e_ms;
+  lat_msg.avg_e2e_ms     = avg_e2e;
+  lat_msg.p99_e2e_ms     = p99_e2e;
   latency_pub_->publish(lat_msg);
 
-  // W8: 현재 위치(x0_)에서 각 장애물까지 최소 거리 계산 및 발행
+  // W8: 현재 위치에서 각 장애물까지 최소 거리 계산 및 발행 (로컬 변수 사용)
   {
     double min_dist = 1e9;
-    for (const auto & obs : obstacles_) {
-      double dx = x0_(0) - obs.x;
-      double dy = x0_(1) - obs.y;
+    for (const auto & obs : local_obstacles) {
+      double dx = local_x0(0) - obs.x;
+      double dy = local_x0(1) - obs.y;
       double clearance = std::sqrt(dx * dx + dy * dy) - obs.radius;
       min_dist = std::min(min_dist, clearance);
     }
@@ -384,17 +501,15 @@ void MpcNode::controlCallback()
     dist_msg.min_distance_m = min_dist;
     min_dist_pub_->publish(dist_msg);
 
-    // 경고: 안전 거리(0.2m) 이내 진입 시 로그
     if (min_dist < -0.2) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 500,
         "장애물 근접! min_clearance=%.3fm", min_dist);
     }
   }
 
-  // 주기적 터미널 로그 (1Hz)
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-    "[MPC] solve=%.2fms avg=%.2fms | v=%.3f w=%.3f | cost=%.2f",
-    elapsed_ms, avg_ms, v_cmd, w_cmd, sol.cost);
+    "[MPC] solve=%.2fms avg=%.2fms | e2e=%.2fms avg_e2e=%.2fms p99_e2e=%.2fms | v=%.3f w=%.3f",
+    elapsed_ms, avg_ms, e2e_ms, avg_e2e, p99_e2e, v_cmd, w_cmd);
 }
 
 // ============================================================
@@ -412,7 +527,7 @@ void MpcNode::controlCallback()
 void MpcNode::initWaypoints()
 {
   waypoints_.clear();
-  double v_ref = 0.15;  // 원형 경로: 선형화 오차 줄이기 위해 속도 절반
+  // double v_ref_ = 0.15;  // 원형 경로: 선형화 오차 줄이기 위해 속도 절반
   // v=0.3이면 N=20 구간(0.4s)에서 heading이 0.12rad 변화
   // v=0.15이면 0.06rad 변화 → linearization 오차 절반
 
@@ -425,7 +540,7 @@ void MpcNode::initWaypoints()
       wp(1) = 0.0;       // y
       // wp(1) = x0_(1); // 로봇 초기 y 위치로 맞춤
       wp(2) = 0.0;     // θ (정면)
-      wp(3) = 0.3;     // v
+      wp(3) = v_ref_;     // v
       wp(4) = 0.0;       // ω
       waypoints_.push_back(wp);
     }
@@ -434,11 +549,11 @@ void MpcNode::initWaypoints()
   } else if (trajectory_type_ == "circle") {
     // 원: 반지름 1.5m, 반시계 방향
     double r      = 0.5;
-    double period = 2.0 * M_PI * r / v_ref;    // 한 바퀴 걸리는 시간 [s]
+    double period = 2.0 * M_PI * r / v_ref_;    // 한 바퀴 걸리는 시간 [s]
     // MPC 예측 주기와 동일하게 맞춤 (0.02s)
     double dt_wp  = mpc_params_.dt;                         // waypoint 간격 [s]
     int    n_pts  = static_cast<int>(period / dt_wp);
-    double w_ref  = v_ref / r;                   // ω = v/r
+    double w_ref  = v_ref_ / r;                   // ω = v/r
 
     for (int i = 0; i <= n_pts; ++i) {
       double t   = i * dt_wp;
@@ -447,7 +562,7 @@ void MpcNode::initWaypoints()
       wp(0) = r * std::cos(ang) - r;   // 원점에서 출발하도록 오프셋
       wp(1) = r * std::sin(ang);
       wp(2) = ang + M_PI / 2.0;        // 접선 방향 (θ = 각도 + 90°)
-      wp(3) = v_ref;
+      wp(3) = v_ref_;
       wp(4) = w_ref;
       waypoints_.push_back(wp);
     }
@@ -457,8 +572,8 @@ void MpcNode::initWaypoints()
     // 8자: lemniscate 근사 (두 원을 이어붙인 형태)
     double r      = 0.7;
     double dt_wp  = mpc_params_.dt;  // 예측 주기와 동일하게 맞춤 (0.02)
-    double w_ref  = v_ref / r;
-    int    n_half = static_cast<int>(M_PI * r / v_ref / dt_wp);
+    double w_ref  = v_ref_ / r;
+    int    n_half = static_cast<int>(M_PI * r / v_ref_ / dt_wp);
 
     // 첫 번째 원 (반시계, 왼쪽 원)
     for (int i = 0; i <= n_half * 2; ++i) {
@@ -467,7 +582,7 @@ void MpcNode::initWaypoints()
       wp(0) =  r * std::cos(ang) - r;
       wp(1) =  r * std::sin(ang);
       // wp(2)는 generateReference에서 실시간 계산하므로 생략
-      wp(3) = v_ref;
+      wp(3) = v_ref_;
       wp(4) = w_ref;
       waypoints_.push_back(wp);
     }
@@ -480,7 +595,7 @@ void MpcNode::initWaypoints()
       wp(0) =  r * std::cos(ang) + r;
       wp(1) =  r * std::sin(ang);
       // wp(2)는 실시간 계산하므로 생략
-      wp(3) = v_ref;
+      wp(3) = v_ref_;
       wp(4) = -w_ref;
       waypoints_.push_back(wp);
     }
@@ -624,27 +739,31 @@ void MpcNode::publishCmdVel(double v, double omega)
   msg.angular.z = omega;  
 
   if (delay_ms_ > 0.0) {
-    // 1. 계산된 원본 명령을 큐에 보관 (MPC는 이 값을 바탕으로 미래를 예측함)
-    delay_queue_.push_back(msg);
+    // [원리 설명]
+    // 여기서부터 큐에 데이터를 넣고 빼는 작업이 시작됩니다.
+    // 락(Lock)을 걸어 이 작업이 끝날 때까지 publishStop() 등 다른 함수가 
+    // delay_queue_에 접근하지 못하도록 보호합니다.
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_); 
+      delay_queue_.push_back(msg);
 
-    int delay_steps = static_cast<int>(delay_ms_ / (mpc_params_.dt * 1000.0));
+      int delay_steps = static_cast<int>(delay_ms_ / (mpc_params_.dt * 1000.0));
 
-    if (static_cast<int>(delay_queue_.size()) > delay_steps) {
-      geometry_msgs::msg::Twist pop_msg = delay_queue_.front();
-      delay_queue_.pop_front();
-      
-      // [외란 주입] 실제 모터로 전달되기 직전에 슬립 발생
-      // 로봇은 MPC가 의도한 속도보다 slip_ratio_ 만큼 느리게 움직이게 됨
-      geometry_msgs::msg::Twist slip_msg;
-      slip_msg.linear.x  = pop_msg.linear.x * (1.0 - slip_ratio_);
-      slip_msg.angular.z = pop_msg.angular.z * (1.0 - slip_ratio_);
-      cmd_vel_pub_->publish(slip_msg);
-    } else {
-      geometry_msgs::msg::Twist stop_msg;
-      cmd_vel_pub_->publish(stop_msg);
-    }
+      if (static_cast<int>(delay_queue_.size()) > delay_steps) {
+        geometry_msgs::msg::Twist pop_msg = delay_queue_.front();
+        delay_queue_.pop_front();
+        
+        geometry_msgs::msg::Twist slip_msg;
+        slip_msg.linear.x  = pop_msg.linear.x * (1.0 - slip_ratio_);
+        slip_msg.angular.z = pop_msg.angular.z * (1.0 - slip_ratio_);
+        cmd_vel_pub_->publish(slip_msg);
+      } else {
+        geometry_msgs::msg::Twist stop_msg;
+        cmd_vel_pub_->publish(stop_msg);
+      }
+    } // 중괄호가 끝나는 이 시점에서 lock_guard의 수명이 다하며 자동으로 락이 해제됩니다.
   } else {
-    // 지연이 없을 때도 슬립 외란 적용
+    // 지연이 없을 때는 큐를 사용하지 않으므로 락이 필요 없습니다.
     geometry_msgs::msg::Twist slip_msg;
     slip_msg.linear.x  = msg.linear.x * (1.0 - slip_ratio_);
     slip_msg.angular.z = msg.angular.z * (1.0 - slip_ratio_);
@@ -657,14 +776,21 @@ void MpcNode::publishCmdVel(double v, double omega)
 // ============================================================
 void MpcNode::publishStop()
 {
+  // 정지 토픽 발행 자체는 ROS2 미들웨어가 알아서 처리하므로 락이 필요 없습니다.
   geometry_msgs::msg::Twist msg;
   msg.linear.x  = 0.0;
   msg.angular.z = 0.0;
   cmd_vel_pub_->publish(msg);
 
+  // [원리 설명]
   // 이전 입력 초기화 및 남아있는 지연 명령 싹 비우기
-  u_prev_.setZero();
-  delay_queue_.clear();
+  // 이 순간 controlCallback에서 x_pred를 예측하기 위해 delay_queue_를 복사하려 하거나, 
+  // u_prev_를 참조하려 할 수 있습니다. 이를 방지하기 위해 락을 획득합니다.
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_);
+    u_prev_.setZero();
+    delay_queue_.clear();
+  } // 초기화가 안전하게 완료되면 락이 해제됩니다.
 }
 // // ============================================================
 // // publishCmdVel() — /cmd_vel 발행

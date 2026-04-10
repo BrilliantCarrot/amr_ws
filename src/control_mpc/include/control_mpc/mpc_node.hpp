@@ -25,13 +25,14 @@
 //   50Hz (20ms) 타이머로 구동
 //   타이머 콜백에서 매번 QP를 풀고 /cmd_vel 발행
 // ============================================================
-
+#include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <deque>
 #include <nav_msgs/msg/odometry.hpp>
 #include <geometry_msgs/msg/twist.hpp>
 #include <amr_msgs/msg/control_latency.hpp>
-#include <amr_msgs/msg/localization_status.hpp>
+#include <amr_msgs/msg/localization_status.hpp> // 추후 삭제 가능
+#include <amr_msgs/msg/safety_status.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>   // x_ref[0] → /mpc/reference_pose 발행용
 #include <amr_msgs/msg/obstacle_array.hpp>
 #include "control_mpc/mpc_core.hpp"
@@ -67,6 +68,9 @@ private:
   // --------------------------------------------------------
   void locStatusCallback(
     const amr_msgs::msg::LocalizationStatus::SharedPtr msg);
+
+  void safetyStateCallback(
+  const amr_msgs::msg::SafetyStatus::SharedPtr msg);
 
   // --------------------------------------------------------
   // MPC 제어 루프 타이머 콜백 (50Hz = 20ms)
@@ -130,10 +134,20 @@ private:
 
   // --- ROS2 인터페이스 ---
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr         odom_sub_;
-  rclcpp::Subscription<amr_msgs::msg::LocalizationStatus>::SharedPtr loc_sub_;
+  rclcpp::Subscription<amr_msgs::msg::LocalizationStatus>::SharedPtr loc_sub_; // 추후 삭제 가능
+  rclcpp::Subscription<amr_msgs::msg::SafetyStatus>::SharedPtr safety_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr           cmd_vel_pub_;
   rclcpp::Publisher<amr_msgs::msg::ControlLatency>::SharedPtr       latency_pub_;
   rclcpp::TimerBase::SharedPtr                                      control_timer_;
+
+  // 센서 데이터 수신용 상호 배제 그룹 (odom, loc, safety, obs 등 데이터 업데이트 전용)
+  rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
+  
+  // 제어 타이머 전용 상호 배제 그룹 (MPC 최적화 연산 전용)
+  rclcpp::CallbackGroup::SharedPtr control_cb_group_;
+  
+  // 스레드 간 공유 자원(x0_, obstacles_, delay_queue_ 등)의 동시 접근을 막아주는 뮤텍스
+  std::mutex state_mutex_;
   
   // W8 추가: tracking_rmse_node가 구독하는 현재 목표 지점 발행 publisher
   // x_ref[0] (map frame) → geometry_msgs/PoseStamped 형태로 발행
@@ -156,6 +170,8 @@ private:
   // --- 현재 상태 ---
   StateVec x0_;              // 현재 로봇 상태 [x, y, θ, v, ω]
   bool     has_odom_ = false; // 첫 odom 수신 여부
+  rclcpp::Time last_odom_stamp_;          // W11 Step7: e2e latency 측정용
+  std::vector<double> e2e_history_;       // e2e latency 히스토리
 
   // --- 이전 입력 (입력 연속성 제약용) ---
   InputVec u_prev_;          // [v_prev, ω_prev] — Δu 계산에 사용
@@ -169,7 +185,9 @@ private:
   // bool waypoints_rerouted_ = false;  // rerouteWaypointsAroundObstacles 중복 실행 방지
 
   // --- Localization 상태 캐시 ---
-  uint8_t loc_status_ = 0;   // 0=NORMAL, 1=DEGRADED, 2=LOST
+  uint8_t loc_status_ = 0;   // 0=NORMAL, 1=DEGRADED, 2=LOST, 추후 삭제 가능
+
+  uint8_t safety_state_ = 0;  // /safety/state → 0=NORMAL, 1=DEGRADED, 2=SAFE_STOP, 3=MANUAL_OVERRIDE
 
   // --- 파라미터 ---
   std::string trajectory_type_;  // "straight" / "circle" / "figure8"
@@ -177,7 +195,10 @@ private:
   double      delay_ms_;         // 제어 지연 주입용 파라미터 [ms]
   // W7: 바퀴 슬립 외란 주입용 파라미터 (0.0 ~ 1.0)
   // 예: 0.3이면 명령한 동력의 30%가 헛바퀴로 날아감을 의미
-  double      slip_ratio_;       
+  double      slip_ratio_;
+  rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
+  double artificial_load_ms_ = 0.0;
+  double v_ref_ = 0.1;
 
   // W7: 진짜 제어 지연 주입을 위한 큐
   std::deque<geometry_msgs::msg::Twist> delay_queue_;

@@ -15,13 +15,13 @@ from ament_index_python.packages import get_package_share_directory
 
 def launch_setup(context, *args, **kwargs):
 
-    pkg_scenarios   = get_package_share_directory('scenarios')
+    pkg_scenarios    = get_package_share_directory('scenarios')
     pkg_localization = get_package_share_directory('localization')
 
     # world 인자를 런치 시간에 문자열로 평가
     # perform(context): LaunchConfiguration 객체 → 실제 문자열로 변환
     # 이렇게 해야 world_name + '.sdf' 같은 파이썬 문자열 연산이 가능함
-    world_name = LaunchConfiguration('world').perform(context)
+    world_name = LaunchConfiguration('world').perform(context).strip()
     urdf_file  = os.path.join(pkg_scenarios, 'urdf', 'amr_robot.urdf.xacro')
     world_file = os.path.join(pkg_scenarios, 'worlds', world_name + '.sdf')
 
@@ -78,25 +78,42 @@ def launch_setup(context, *args, **kwargs):
         ]
     )
 
-    # 8초 후 ros_ign_bridge 실행 (센서/액추에이터 토픽 브릿지)
-    # 브릿지 방향 기호:
-    #   ]  ROS2 → Ignition (단방향)
-    #   [  Ignition → ROS2 (단방향)
+    # --------------------------------------------------------
+    # W11 Step1: mock_link 활성화 여부에 따라 브릿지 YAML 분기
+    #
+    #   mock_link:=false (기본):
+    #     ros_gz_bridge.yaml 사용
+    #     ROS /cmd_vel → Ignition /cmd_vel 직접 연결
+    #
+    #   mock_link:=true:
+    #     ros_gz_bridge_mock_link.yaml 사용
+    #     ROS /cmd_vel_delayed → Ignition /cmd_vel 연결
+    #
+    #   [중요] config_file + arguments 혼용 금지.
+    #     ros_gz_bridge에서 두 방식을 동시에 쓰면 충돌 발생.
+    #     Ground Truth 토픽 포함 모든 토픽을 YAML에 명시.
+    # --------------------------------------------------------
+    mock_link_enabled = LaunchConfiguration('mock_link').perform(context).strip().lower()
+    use_mock_link = (mock_link_enabled == 'true')
+
+    if use_mock_link:
+        bridge_config = os.path.join(
+            pkg_scenarios, 'config', 'ros_gz_bridge_mock_link.yaml')
+    else:
+        bridge_config = os.path.join(
+            pkg_scenarios, 'config', 'ros_gz_bridge.yaml')
+
+    # 8초 후 브릿지 실행
+    # config_file 파라미터만 사용 (arguments 없음)
     bridge = TimerAction(
         period=8.0,
         actions=[
             Node(
-                package='ros_ign_bridge',
+                package='ros_gz_bridge',
                 executable='parameter_bridge',
-                arguments=[
-                    '/cmd_vel@geometry_msgs/msg/Twist]ignition.msgs.Twist',
-                    '/odom@nav_msgs/msg/Odometry[ignition.msgs.Odometry',
-                    '/imu@sensor_msgs/msg/Imu[ignition.msgs.IMU',
-                    '/scan@sensor_msgs/msg/LaserScan[ignition.msgs.LaserScan',
-                    # Ground Truth: EKF RMSE 계산용 실제 로봇 위치
-                    '/world/simple_room/dynamic_pose/info@tf2_msgs/msg/TFMessage[ignition.msgs.Pose_V',
-                ],
-                output='screen'
+                name='parameter_bridge',
+                output='screen',
+                parameters=[{'config_file': bridge_config}],
             )
         ]
     )
@@ -115,13 +132,51 @@ def launch_setup(context, *args, **kwargs):
         ]
     )
 
-    return [
-        robot_state_publisher,
-        gazebo,
-        spawn_robot,
-        bridge,
-        slam_launch,
-    ]
+    # mock_link_node: mock_link:=true 일 때만 실행 (10초 후)
+    if use_mock_link:
+        delay_ms_val     = float(LaunchConfiguration('delay_ms').perform(context).strip())
+        drop_rate_val    = float(LaunchConfiguration('drop_rate').perform(context).strip())
+        burst_prob_val   = float(LaunchConfiguration('burst_loss_prob').perform(context).strip())
+        burst_len_val    = int(LaunchConfiguration('burst_loss_len').perform(context).strip())
+        reorder_prob_val = float(LaunchConfiguration('reorder_prob').perform(context).strip())
+        reorder_max_val  = float(LaunchConfiguration('reorder_max_delay_ms').perform(context).strip())
+
+        mock_link_action = TimerAction(
+            period=10.0,
+            actions=[
+                Node(
+                    package='safety',
+                    executable='mock_link_node',
+                    name='mock_link_node',
+                    output='screen',
+                    parameters=[{
+                        'enabled':              True,
+                        'delay_ms':             delay_ms_val,
+                        'drop_rate':            drop_rate_val,
+                        'burst_loss_prob':      burst_prob_val,
+                        'burst_loss_len':       burst_len_val,
+                        'reorder_prob':         reorder_prob_val,
+                        'reorder_max_delay_ms': reorder_max_val,
+                    }]
+                )
+            ]
+        )
+        return [
+            robot_state_publisher,
+            gazebo,
+            spawn_robot,
+            bridge,
+            slam_launch,
+            mock_link_action,
+        ]
+    else:
+        return [
+            robot_state_publisher,
+            gazebo,
+            spawn_robot,
+            bridge,
+            slam_launch,
+        ]
 
 
 def generate_launch_description():
@@ -146,10 +201,48 @@ def generate_launch_description():
         description='true이면 slam_toolbox 맵 생성 모드 실행'
     )
 
+    # W11 Step1: mock_link 관련 인자
+    declare_mock_link = DeclareLaunchArgument(
+        'mock_link',
+        default_value='false',
+        description='true이면 mock_link_node 실행 (통신 이상 주입)'
+    )
+    declare_delay_ms = DeclareLaunchArgument(
+        'delay_ms', default_value='0.0',
+        description='mock_link: 고정 전파 지연 [ms]'
+    )
+    declare_drop_rate = DeclareLaunchArgument(
+        'drop_rate', default_value='0.0',
+        description='mock_link: 독립 드롭 확률 [0.0~1.0]'
+    )
+    declare_burst_loss_prob = DeclareLaunchArgument(
+        'burst_loss_prob', default_value='0.0',
+        description='mock_link: burst 손실 시작 확률'
+    )
+    declare_burst_loss_len = DeclareLaunchArgument(
+        'burst_loss_len', default_value='3',
+        description='mock_link: burst 연속 드롭 수'
+    )
+    declare_reorder_prob = DeclareLaunchArgument(
+        'reorder_prob', default_value='0.0',
+        description='mock_link: reorder 확률'
+    )
+    declare_reorder_max_delay_ms = DeclareLaunchArgument(
+        'reorder_max_delay_ms', default_value='50.0',
+        description='mock_link: reorder 최대 추가 지연 [ms]'
+    )
+
     return LaunchDescription([
         declare_world,
         declare_slam,
+        declare_mock_link,
+        declare_delay_ms,
+        declare_drop_rate,
+        declare_burst_loss_prob,
+        declare_burst_loss_len,
+        declare_reorder_prob,
+        declare_reorder_max_delay_ms,
         # OpaqueFunction: LaunchConfiguration 값을 런치 시간에 문자열로 평가해서
-        # 파이썬 연산(문자열 연결 등)이 가능하도록 함
+        # 파이썬 연산(문자열 연결, 분기 등)이 가능하도록 함
         OpaqueFunction(function=launch_setup),
     ])

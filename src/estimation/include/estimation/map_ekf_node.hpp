@@ -44,8 +44,9 @@
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
 #include <amr_msgs/msg/localization_status.hpp>
-
+#include <mutex>
 #include "estimation/ekf_core.hpp"
+#include "std_msgs/msg/float64.hpp"
 
 namespace estimation
 {
@@ -119,7 +120,8 @@ private:
   //     여기서 map→base_link를 추가로 브로드캐스트하면
   //     TF 트리에 루프가 생겨 충돌함.
   // --------------------------------------------------------
-  void publishMapEkfOdom(const rclcpp::Time & stamp);
+  // void publishMapEkfOdom(const rclcpp::Time & stamp);
+  void publishTimerCallback(); 
 
   // --------------------------------------------------------
   // EKF 초기화
@@ -160,7 +162,17 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr            odom_sub_;
   rclcpp::Subscription<amr_msgs::msg::LocalizationStatus>::SharedPtr  loc_status_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr               map_ekf_pub_;
+  // W10 Step2: watchdog_node의 EKF_DIVERGED 조건 감지용
+  // EkfCore::getInnovationNorm() 값을 50Hz로 발행
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr                innovation_norm_pub_;
   rclcpp::TimerBase::SharedPtr                                        lidar_timer_;
+  // W11 Step5-2: ekf_ 객체 보호용 mutex
+  // MultiThreadedExecutor에서 imu/odom/lidar 콜백이 병렬 실행될 때
+  // ekf_ 상태(x_, P_)에 대한 동시 접근을 방지
+  std::mutex ekf_mutex_;
+  rclcpp::CallbackGroup::SharedPtr sensor_cb_group_;
+  rclcpp::CallbackGroup::SharedPtr pub_timer_cb_group_;
+  rclcpp::TimerBase::SharedPtr     pub_timer_;
 
   // --- TF ---
   // map→base_link TF 조회용

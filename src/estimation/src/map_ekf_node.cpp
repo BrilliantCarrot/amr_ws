@@ -1,5 +1,5 @@
 #include "estimation/map_ekf_node.hpp"
-
+#include <csignal>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <tf2/utils.h>
@@ -17,7 +17,7 @@ MapEkfNode::MapEkfNode(const rclcpp::NodeOptions & options)
   first_imu_(true),
   is_ekf_initialized_(false),
   cached_loc_status_(STATUS_NORMAL)  // 초기값: NORMAL (안전한 방향)
-{
+  {
   // --------------------------------------------------------
   // ROS2 파라미터 선언 및 로드
   //
@@ -51,25 +51,32 @@ MapEkfNode::MapEkfNode(const rclcpp::NodeOptions & options)
   auto sensor_qos   = rclcpp::SensorDataQoS();
   auto reliable_qos = rclcpp::QoS(10).reliable();
 
+    // 콜백 그룹 생성
+  sensor_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  pub_timer_cb_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+
+  auto sensor_opt = rclcpp::SubscriptionOptions();
+  sensor_opt.callback_group = sensor_cb_group_;
+
   // --------------------------------------------------------
   // Subscriber 생성
   // --------------------------------------------------------
   imu_sub_ = this->create_subscription<sensor_msgs::msg::Imu>(
     "/imu",
     sensor_qos,
-    std::bind(&MapEkfNode::imuCallback, this, std::placeholders::_1)
+    std::bind(&MapEkfNode::imuCallback, this, std::placeholders::_1), sensor_opt
   );
 
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
     "/odom",
     reliable_qos,
-    std::bind(&MapEkfNode::odomCallback, this, std::placeholders::_1)
+    std::bind(&MapEkfNode::odomCallback, this, std::placeholders::_1), sensor_opt
   );
 
   loc_status_sub_ = this->create_subscription<amr_msgs::msg::LocalizationStatus>(
     "/localization/status",
     reliable_qos,
-    std::bind(&MapEkfNode::localizationStatusCallback, this, std::placeholders::_1)
+    std::bind(&MapEkfNode::localizationStatusCallback, this, std::placeholders::_1), sensor_opt
   );
 
   // --------------------------------------------------------
@@ -80,6 +87,13 @@ MapEkfNode::MapEkfNode(const rclcpp::NodeOptions & options)
   map_ekf_pub_ = this->create_publisher<nav_msgs::msg::Odometry>(
     "/map_ekf/odom", reliable_qos
   );
+
+  // W10 Step2: EKF innovation norm 발행 (watchdog_node 구독용)
+  // odom update 직후 innovation_norm을 50Hz로 발행
+  innovation_norm_pub_ = this->create_publisher<std_msgs::msg::Float64>(
+    "/map_ekf/innovation_norm", reliable_qos
+  );
+
 
   // --------------------------------------------------------
   // TF 리스너 초기화
@@ -103,7 +117,13 @@ MapEkfNode::MapEkfNode(const rclcpp::NodeOptions & options)
   // --------------------------------------------------------
   lidar_timer_ = this->create_wall_timer(
     std::chrono::milliseconds(100),  // 10Hz
-    std::bind(&MapEkfNode::lidarUpdateCallback, this)
+    std::bind(&MapEkfNode::lidarUpdateCallback, this), sensor_cb_group_
+  );
+
+    // 50Hz (20ms) EKF 상태 발행 타이머 추가
+  pub_timer_ = this->create_wall_timer(
+    std::chrono::milliseconds(20),
+    std::bind(&MapEkfNode::publishTimerCallback, this), pub_timer_cb_group_
   );
 
   // --------------------------------------------------------
@@ -193,6 +213,7 @@ void MapEkfNode::imuCallback(const sensor_msgs::msg::Imu::SharedPtr msg)
   const double ay        = msg->linear_acceleration.y;
   const double omega_imu = msg->angular_velocity.z;
 
+  std::lock_guard<std::mutex> lock(ekf_mutex_); // EKF 연산 직전 락
   ekf_.predict(ax, ay, omega_imu, dt);
 }
 
@@ -212,11 +233,13 @@ void MapEkfNode::odomCallback(const nav_msgs::msg::Odometry::SharedPtr msg)
   const double vy_odom    = msg->twist.twist.linear.y;
   const double omega_odom = msg->twist.twist.angular.z;
 
-  // Odom으로 속도 보정
-  ekf_.update(vx_odom, vy_odom, omega_odom);
-
+  {
+    std::lock_guard<std::mutex> lock(ekf_mutex_); // EKF 연산 부분만 락
+    // Odom으로 속도 보정
+    ekf_.update(vx_odom, vy_odom, omega_odom);
+  }
   // 보정된 상태 발행
-  publishMapEkfOdom(msg->header.stamp);
+  // publishMapEkfOdom(msg->header.stamp);
 }
 
 // ============================================================
@@ -295,6 +318,7 @@ void MapEkfNode::lidarUpdateCallback()
     R_lidar(2, 2) = r_lidar_degraded_yaw_;
   }
 
+  std::lock_guard<std::mutex> lock(ekf_mutex_); // EKF 연산 직전 락
   // LiDAR 관측으로 EKF 보정
   ekf_.updateLidar(map_x, map_y, map_yaw, R_lidar);
 }
@@ -303,35 +327,42 @@ void MapEkfNode::lidarUpdateCallback()
 // EKF 결과 발행
 //   map 프레임 기준 fused pose를 /map_ekf/odom으로 발행.
 // ============================================================
-void MapEkfNode::publishMapEkfOdom(const rclcpp::Time & stamp)
+void MapEkfNode::publishTimerCallback()
 {
-  const StateVec & x = ekf_.getState();
+  if (!is_ekf_initialized_) return;
 
+  // 1. 상태 빠르게 복사 후 락 해제
+  StateVec local_x;
+  double local_innov_norm;
+  {
+    std::lock_guard<std::mutex> lock(ekf_mutex_);
+    local_x = ekf_.getState();
+    local_innov_norm = ekf_.getInnovationNorm();
+  } // 락 해제 완료 (센서 콜백 블로킹 없음)
+
+  // 2. 복사된 상태로 발행 로직 수행
   nav_msgs::msg::Odometry msg;
-  msg.header.stamp    = stamp;
-  msg.header.frame_id = "map";        // map 프레임 기준 (ekf_node는 "odom")
+  msg.header.stamp    = this->now();
+  msg.header.frame_id = "map";
   msg.child_frame_id  = "base_link";
 
-  // 위치
-  msg.pose.pose.position.x = x(0);
-  msg.pose.pose.position.y = x(1);
+  msg.pose.pose.position.x = local_x(0);
+  msg.pose.pose.position.y = local_x(1);
   msg.pose.pose.position.z = 0.0;
 
-  // yaw → 쿼터니언 변환
-  // [왜 쿼터니언인가?]
-  //   nav_msgs::Odometry는 pose에 쿼터니언을 사용함.
-  //   짐벌락(Gimbal Lock) 문제 없이 3D 회전을 표현하기 위한 표준.
-  //   2D 로봇이지만 메시지 형식이 3D 기반이라 변환 필요.
   tf2::Quaternion q;
-  q.setRPY(0.0, 0.0, x(2));  // roll=0, pitch=0, yaw=θ
+  q.setRPY(0.0, 0.0, local_x(2));
   msg.pose.pose.orientation = tf2::toMsg(q);
 
-  // 속도 (body frame)
-  msg.twist.twist.linear.x  = x(3);
-  msg.twist.twist.linear.y  = x(4);
-  msg.twist.twist.angular.z = x(5);
+  msg.twist.twist.linear.x  = local_x(3);
+  msg.twist.twist.linear.y  = local_x(4);
+  msg.twist.twist.angular.z = local_x(5);
 
   map_ekf_pub_->publish(msg);
+
+  std_msgs::msg::Float64 innov_msg;
+  innov_msg.data = local_innov_norm;
+  innovation_norm_pub_->publish(innov_msg);
 }
 
 // ============================================================
@@ -399,10 +430,11 @@ void MapEkfNode::initializeEkf()
   // 로봇 위치를 전혀 모르면 → 10.0m²가 적절
   // ekf_core에 이 값을 하드코딩하면 다른 상황에서 재사용하기 어려워짐. 
   // 노드에서 init(x0, P0)로 주입하는 구조이기 때문에 ekf_core는 어떤 상황에서도 그냥 받아서 쓰면 됨.
-
-  ekf_.init(x0, P0);
-  is_ekf_initialized_ = true;
-
+  {
+    std::lock_guard<std::mutex> lock(ekf_mutex_); // 초기화 시 락
+    ekf_.init(x0, P0);
+    is_ekf_initialized_ = true;
+  }
   RCLCPP_INFO(
     this->get_logger(),
     "[map_ekf_node] EKF 초기화 완료. 초기 map pose: x=%.3f, y=%.3f, yaw=%.3f",
@@ -477,8 +509,36 @@ bool MapEkfNode::getMapPose(double & x, double & y, double & yaw)
 }  // namespace estimation
 
 // ============================================================
-// main 함수
+// main
 // ============================================================
+std::shared_ptr<rclcpp::executors::MultiThreadedExecutor> g_map_executor;
+
+void signalHandlerMap(int signum)
+{
+  (void)signum;
+  if (g_map_executor) {
+    g_map_executor->cancel();
+  }
+  rclcpp::shutdown();
+}
+
+// 멀티스레드용 main 함수
+// int main(int argc, char * argv[])
+// {
+//   rclcpp::init(argc, argv);
+//   std::signal(SIGINT, signalHandlerMap);
+  
+//   auto node = std::make_shared<estimation::MapEkfNode>();
+//   g_map_executor = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
+//   g_map_executor->add_node(node);
+  
+//   g_map_executor->spin();
+  
+//   g_map_executor->remove_node(node);
+//   return 0;
+// }
+
+// 싱글 스레드용 main 함수
 int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);

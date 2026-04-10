@@ -1,3 +1,11 @@
+# ros_gz_bridge.yaml
+# W10 이전 기존 설정 + Ground Truth 토픽 추가
+#
+# [변경사항]
+#   Ground Truth 토픽을 argument 방식 대신 YAML에 포함.
+#   config_file + arguments 혼용 시 ros_gz_bridge에서
+#   충돌이 발생할 수 있으므로 YAML 단일 방식으로 통일.
+
 - ros_topic_name: "/cmd_vel"
   gz_topic_name: "/cmd_vel"
   ros_type_name: "geometry_msgs/msg/Twist"
@@ -20,4 +28,10 @@
   gz_topic_name: "/scan"
   ros_type_name: "sensor_msgs/msg/LaserScan"
   gz_type_name: "gz.msgs.LaserScan"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/world/simple_room/dynamic_pose/info"
+  gz_topic_name: "/world/simple_room/dynamic_pose/info"
+  ros_type_name: "tf2_msgs/msg/TFMessage"
+  gz_type_name: "gz.msgs.Pose_V"
   direction: GZ_TO_ROS
