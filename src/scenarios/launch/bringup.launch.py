@@ -161,22 +161,63 @@ def launch_setup(context, *args, **kwargs):
                 )
             ]
         )
-        return [
-            robot_state_publisher,
-            gazebo,
-            spawn_robot,
-            bridge,
-            slam_launch,
-            mock_link_action,
-        ]
-    else:
-        return [
-            robot_state_publisher,
-            gazebo,
-            spawn_robot,
-            bridge,
-            slam_launch,
-        ]
+
+    # --------------------------------------------------------
+    # W12: path_planner_node (글로벌 경로계획)
+    #
+    #   use_planner:=true 일 때만 실행 (15초 후 — SLAM 안정화 대기)
+    #   slam_toolbox가 /map을 발행하기까지 보통 10~15초 소요.
+    #
+    #   goal_x/y: launch 파라미터로 기본 목표 지점 설정
+    #   런타임 중 RViz2 "2D Goal Pose" 또는
+    #   ros2 topic pub /goal_pose 로 동적 변경 가능.
+    # --------------------------------------------------------
+    use_planner_str = LaunchConfiguration('use_planner').perform(context).strip().lower()
+    # goal_x/y는 use_planner=true일 때만 읽음
+    goal_x_val = 2.0
+    goal_y_val = 0.0
+    if use_planner_str == 'true':
+        goal_x_val = float(LaunchConfiguration('goal_x').perform(context).strip())
+        goal_y_val = float(LaunchConfiguration('goal_y').perform(context).strip())
+
+    common_nodes = [
+        robot_state_publisher,
+        gazebo,
+        spawn_robot,
+        bridge,
+        slam_launch,
+    ]
+
+    if use_planner_str == 'true':
+        path_planner_action = TimerAction(
+            period=15.0,   # SLAM이 /map 발행할 때까지 대기
+            actions=[
+                ExecuteProcess(
+                cmd=[
+                '/bin/bash', '-c',
+                f'source /opt/ros/humble/setup.bash && '
+                f'source /home/lyj/amr_ws/install/setup.bash && '
+                f'ros2 run planning path_planner_node '
+                f'--ros-args '
+                f'-p goal_x:={goal_x_val} '
+                f'-p goal_y:={goal_y_val} '
+                f'-p robot_radius:=0.7 '
+                f'-p replan_period_sec:=2.0 '
+                f'-p replan_obs_dist:=0.5 '
+                f'-p wp_spacing:=0.05 '
+                f'-p goal_tolerance:=0.20'
+            ],
+            output='screen',
+            shell=False
+        )
+            ]
+        )
+        common_nodes.append(path_planner_action)
+
+    if use_mock_link:
+        common_nodes.append(mock_link_action)
+
+    return common_nodes
 
 
 def generate_launch_description():
@@ -232,6 +273,23 @@ def generate_launch_description():
         description='mock_link: reorder 최대 추가 지연 [ms]'
     )
 
+    # W12: 글로벌 경로계획 관련 인자
+    # 사용 예:
+    #   ros2 launch scenarios bringup.launch.py use_planner:=true goal_x:=2.0 goal_y:=1.0
+    declare_use_planner = DeclareLaunchArgument(
+        'use_planner',
+        default_value='false',
+        description='true이면 path_planner_node 실행 (A* 글로벌 경로계획)'
+    )
+    declare_goal_x = DeclareLaunchArgument(
+        'goal_x', default_value='2.0',
+        description='기본 목표 x 좌표 [m] (map frame)'
+    )
+    declare_goal_y = DeclareLaunchArgument(
+        'goal_y', default_value='0.0',
+        description='기본 목표 y 좌표 [m] (map frame)'
+    )
+
     return LaunchDescription([
         declare_world,
         declare_slam,
@@ -242,6 +300,9 @@ def generate_launch_description():
         declare_burst_loss_len,
         declare_reorder_prob,
         declare_reorder_max_delay_ms,
+        declare_use_planner,   # W12 추가
+        declare_goal_x,        # W12 추가
+        declare_goal_y,        # W12 추가
         # OpaqueFunction: LaunchConfiguration 값을 런치 시간에 문자열로 평가해서
         # 파이썬 연산(문자열 연결, 분기 등)이 가능하도록 함
         OpaqueFunction(function=launch_setup),

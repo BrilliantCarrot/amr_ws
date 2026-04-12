@@ -45,6 +45,10 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("delay_ms",        0.0); // 기본값은 지연 없음
   this->declare_parameter("slip_ratio",      0.0); // 기본값은 슬립 없음
   this->declare_parameter("artificial_load_ms", 0.0); // 기본 cpu 부하는 없음
+  // W12: 글로벌 경로계획 연동 파라미터
+  // true: path_planner_node의 /planned_path 수신 후 제어 시작
+  // false: 기존 hardcoded 경로(trajectory_type) 사용 (하위호환)
+  this->declare_parameter("use_global_planner", false);
 
   // 파라미터 로드
   mpc_params_       = loadMpcParams();
@@ -53,6 +57,7 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   delay_ms_         = this->get_parameter("delay_ms").as_double();
   slip_ratio_       = this->get_parameter("slip_ratio").as_double();
   artificial_load_ms_ = this->get_parameter("artificial_load_ms").as_double();
+  use_global_planner_ = this->get_parameter("use_global_planner").as_bool();
 
   // 런타임 파라미터 변경 콜백
   // ros2 param set으로 변경 시 즉시 멤버변수에 반영
@@ -90,7 +95,14 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   // RCLCPP_INFO(this->get_logger(), "W8: 장애물 %zu개 설정 완료", obstacles_.size());
 
   // --- Waypoint 초기화 ---
-  initWaypoints();
+  // 글로벌 경로계획 모드: hardcoded 경로 초기화 건너뜀
+  // → /planned_path 수신 시 pathCallback에서 waypoints_ 갱신
+  if (!use_global_planner_) {
+    initWaypoints();
+  } else {
+    RCLCPP_INFO(this->get_logger(),
+      "[MPC] 글로벌 경로계획 모드: /planned_path 대기 중...");
+  }
 
   // --- 상태 초기화 ---
   x0_.setZero();
@@ -124,6 +136,12 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   safety_sub_ = this->create_subscription<amr_msgs::msg::SafetyStatus>(
   "/safety/state", qos_reliable,
   std::bind(&MpcNode::safetyStateCallback, this, std::placeholders::_1), sensor_opt);
+
+  // W12: /planned_path 구독 — path_planner_node가 발행한 A* 경로 수신
+  // use_global_planner=true일 때만 의미있으나, 항상 구독해두어 런타임 전환 가능
+  path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
+    "/planned_path", rclcpp::QoS(10).reliable(),
+    std::bind(&MpcNode::pathCallback, this, std::placeholders::_1), sensor_opt);
 
   RCLCPP_INFO(this->get_logger(), "W9: Obstacle Tracker 구독 시작"); // 확인용 로그 추가
 
@@ -236,24 +254,135 @@ void MpcNode::obsCallback(const amr_msgs::msg::ObstacleArray::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(state_mutex_);
 
+  // ---------------------------------------------------------------
+  // 글로벌 경로계획 모드(use_global_planner=true)에서는
+  // 장애물 회피를 path_planner_node(A*)가 전담하므로
+  // MPC에 obstacle penalty를 전달하지 않음.
+  //
+  // [역할 분리 원칙]
+  //   path_planner_node : 경로계획 + 장애물 회피 (정적/동적 모두)
+  //   mpc_node          : 순수 경로 추종만 담당
+  //
+  // MPC가 동시에 obstacle penalty를 적용하면:
+  //   A*가 만든 회피 경로 ↔ MPC penalty 방향이 충돌
+  //   → QP infeasible → solve 실패 반복
+  // ---------------------------------------------------------------
+  if (use_global_planner_) {
+    return;
+  }
+
+  // 하드코딩 모드(use_global_planner=false)에서만 기존 동작 유지
   constexpr double ROBOT_RADIUS = 0.2;
-  obstacles_.clear();
+  // 로봇을 점(point)으로 취급하는 대신, 장애물 반경을 미리 로봇 반경만큼 키워두는 트릭
+  // path_planner_node의 inflateMap()과 동일한 개념
+  obstacles_.clear(); // 새 메시지가 올 때마다 이전 프레임을 지우고 장애물을 최신 상태로 갱신
+  // 왜? 로봇이 움직이면서 장애물 위치도 상대적으로 움직이기 때문
+  // 안하면, 로봇이 사라진 장애물이 여전히 있다고 인식해서 불필요하게 회피하거나 경로가 이상해짐
+  // 장애물 반경 팽창 후 저장
   for (int i = 0; i < msg->count; ++i) {
     Obstacle obs;
-    obs.x = msg->x[i];
-    obs.y = msg->y[i];
+    obs.x      = msg->x[i];
+    obs.y      = msg->y[i];
     obs.radius = msg->radius[i] + ROBOT_RADIUS;
-    obs.vx = msg->vx[i];
-    obs.vy = msg->vy[i];
+    obs.vx     = msg->vx[i];
+    obs.vy     = msg->vy[i];
     obstacles_.push_back(obs);
   }
-  mpc_core_.setObstacles(obstacles_);
+  mpc_core_.setObstacles(obstacles_); // 가공된 장애물 목록을 MPC 코어에 넘김
+  // 왜 use_global_planner=false 일 때만:
+  // use_global_planner=true(A* 연동 모드)에서는 path_planner_node가 이미 장애물을 맵에 마킹하고 회피 경로를 만들어서 
+  // /planned_path로 줌. MPC는 그 경로를 그냥 추종하면 되므로 별도로 장애물을 받을 필요가 없음 
+  // 반면 하드코딩 모드에서는 전역 경로 계획이 없으므로 MPC가 직접 장애물을 인식해서 회피해
 
-  // 디버깅: 수신된 장애물 개수가 0보다 클 때만 출력
   if (!obstacles_.empty()) {
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000, 
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
       "장애물 %zu개 수신 중...", obstacles_.size());
-  } 
+  }
+}
+
+// ============================================================
+// pathCallback() — /planned_path 수신 (W12 글로벌 경로계획 연동)
+//
+//   path_planner_node가 A*로 계산한 경로를 수신해서
+//   waypoints_를 교체함. 기존 hardcoded 경로 대신 사용.
+//
+// [처리]
+//   nav_msgs/Path (PoseStamped[]) → StateVec[] 변환
+//   - x, y: 경로 점의 세계 좌표
+//   - θ    : 0으로 초기화 → generateReference()에서 연속 yaw 재계산
+//   - v    : v_ref_ (파라미터)
+//   - ω    : 0 (MPC가 각속도 제어)
+//
+// [안전]
+//   SingleThreadedExecutor이므로 controlCallback과 동시 실행 없음.
+//   state_mutex_는 향후 MultiThread 전환 대비 이중 보호.
+// ============================================================
+void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
+{
+  if (msg->poses.empty()) {
+    RCLCPP_WARN(this->get_logger(), "[MPC] 빈 /planned_path 수신 — 무시");
+    return;
+  }
+
+  // PoseStamped → StateVec 변환
+  std::vector<StateVec> new_waypoints;
+  new_waypoints.reserve(msg->poses.size());
+  for (const auto & pose_stamped : msg->poses) {
+    StateVec wp;
+    wp(0) = pose_stamped.pose.position.x;
+    wp(1) = pose_stamped.pose.position.y;
+    wp(2) = 0.0;    // θ: generateReference()에서 실시간 계산
+    wp(3) = v_ref_;
+    wp(4) = 0.0;
+    new_waypoints.push_back(wp);
+  }
+
+  // ── 항상 idx=0부터 추종 시작 ─────────────────────────────────
+  // [중요] 이전에 "현재 위치 기준 최근접 waypoint"를 찾아 시작했으나
+  // 이 방식이 문제를 일으킴:
+  //   A* 우회 경로에서 로봇 직선 방향에 있는 경로 중간점이 최근접으로
+  //   탐색되어 우회 구간 전체를 건너뛰고 직진하게 됨.
+  //
+  // path_planner_node가 이미 Step 8(trim)에서 현재 위치에서
+  // 0.15m 이내 점을 제거하므로 경로 첫점은 이미 현재 위치 근처.
+  // → idx=0부터 순서대로 추종하면 우회 경로를 올바르게 따라감.
+
+  // 더 구체적인 설명: 문제가 됐던 방식: 최근접 waypoint 탐색
+  // 예전 코드는 새 경로가 들어오면 현재 로봇 위치에서 가장 가까운 waypoint를 찾아서 거기서부터 추종을 시작했습니다.
+  // 이게 왜 문제냐면, A*가 장애물을 우회하는 경로를 짰을 때 아래처럼 됩니다.
+  
+  // 로봇 현재위치 ──── [wp0] ── [wp1] ── [wp2(우회 시작)]
+  //                                           ↓
+  //                                        [wp3]
+  //                                           ↓
+  //                                        [wp4(우회 끝)] ── [wp5] ── 목표
+  // 로봇 기준으로 직선 거리만 따지면 우회 경로의 중간쯤인 wp4가 실제로 가장 가까울 수 있습니다. 그러면 코드가 wp4를 시작점으로 잡아버리고, 
+  // wp2, wp3 우회 구간 전체를 건너뛰고 직진하게 됩니다. 결과적으로 장애물을 피하라고 A*가 짠 우회 경로가 완전히 무용지물이 됩니다.
+  // 해결책: 항상 idx=0부터 시작
+  // path_planner_node의 plan() Step 8(trim) 에서 이미 현재 위치에서 0.15m 이내의 앞 waypoint들을 제거하고 발행합니다.
+  // 즉, /planned_path로 들어오는 경로의 첫 번째 점(idx=0)은 이미 현재 로봇 위치 근처입니다.
+  // 따라서 굳이 "가장 가까운 점"을 탐색할 필요 없이, 무조건 idx=0부터 순서대로 따라가면 우회 경로도 순서대로 올바르게 추종하게 됩니다.
+  
+  // 발행된 경로:
+  // [wp0(현재위치 근처)] → [wp1] → [wp2 우회] → [wp3 우회] → [wp4] → 목표
+  //    ↑
+  //   여기서 시작 (항상)
+
+  {
+    std::lock_guard<std::mutex> lock(state_mutex_); // MPC 제어 루프와 이 콜백이 동시에 waypoints_를 읽으면
+    // 데이터 레이스 발생 -> mutex로 보호
+    waypoints_      = new_waypoints; // 새 경로로 교체
+    mission_done_   = false; // 새 경로 왔으니 미션 완료 상태 해제
+    closest_wp_idx_ = 0;  // 항상 경로 첫점부터 추종 시작(핵심)
+    // continuous_theta_ 리셋하지 않음 — 현재 heading 연속성 유지해야 MPC 각도 계산 시 ±π 경계에서 값이 튀는 현상을 방지
+  }
+
+  RCLCPP_INFO(this->get_logger(),
+    "[MPC] 새 경로 수신: %zu waypoints | "
+    "첫점 (%.2f, %.2f) → 끝점 (%.2f, %.2f)",
+    new_waypoints.size(),
+    new_waypoints.front()(0), new_waypoints.front()(1),
+    new_waypoints.back()(0),  new_waypoints.back()(1));
 }
 
 // ============================================================
@@ -308,6 +437,15 @@ void MpcNode::controlCallback()
 
   // 멤버 변수 대신 복사해 온 로컬 변수로 상태를 체크합니다.
   if (!local_has_odom) {
+    return;
+  }
+
+  // W12: 글로벌 경로계획 모드에서 경로 미수신 시 대기
+  // SingleThread이므로 waypoints_를 락 없이 읽어도 안전
+  if (use_global_planner_ && waypoints_.empty()) {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "[MPC] /planned_path 대기 중... (path_planner_node 실행 여부 확인)");
+    publishStop();
     return;
   }
   if (local_safety_state == 2){
@@ -620,8 +758,27 @@ void MpcNode::initWaypoints()
 int MpcNode::findClosestWaypoint(const StateVec & x0)
 {
   int n = static_cast<int>(waypoints_.size());
-  int search_end = std::min(closest_wp_idx_ + 20, n);   // 앞으로 20개만 탐색
 
+  // ----------------------------------------------------------------
+  // [수정] 전체 탐색으로 변경
+  //
+  // 기존: closest_wp_idx_ + 20개만 탐색
+  //   → 직선 경로에서는 충분하지만, A* 우회 경로처럼 꺾인 경로에서는
+  //     실제 가장 가까운 waypoint가 탐색 범위 밖에 있어 잘못된 idx를 잡음
+  //     → MPC가 엉뚱한 방향을 reference로 잡아 재계획 트리거 연속 발생
+  //
+  // 수정: closest_wp_idx_부터 전체 탐색
+  //   → 우회 경로에서도 올바른 waypoint를 찾아 안정적으로 추종
+  //   → 단, closest_wp_idx_를 하한으로 유지해 뒤로 가지 않음
+  // ----------------------------------------------------------------
+  // ----------------------------------------------------------------
+  // [탐색 범위 제한]
+  // 전체 탐색(i < n)을 하면 우회 경로에서 경로 후반부(목표 근처)가
+  // 최근접으로 탐색되어 우회 구간 전체를 건너뛰는 문제 발생.
+  // → 현재 idx에서 앞으로 50개만 탐색하여 경로 순서를 보장.
+  //   (wp_spacing=0.05m 기준 50개 = 2.5m 커버)
+  // ----------------------------------------------------------------
+  int search_end = std::min(closest_wp_idx_ + 50, n);
   double min_dist = 1e9;
   int    best_idx = closest_wp_idx_;
 
@@ -665,62 +822,65 @@ int MpcNode::findClosestWaypoint(const StateVec & x0)
  */
 std::vector<StateVec> MpcNode::generateReference(const StateVec & x0)
 {
-  // 가장 가까운 waypoint 갱신
-  // 1. 현재 위치에서 전체 경로(Waypoints) 중 가장 가까운 점의 인덱스를 찾습니다.
-  // 이 인덱스를 기준으로 MPC의 예측 지평선(Horizon)을 전개합니다.
   closest_wp_idx_ = findClosestWaypoint(x0);
 
   int n = static_cast<int>(waypoints_.size());
-  // 2. 결과를 담을 벡터를 선언합니다. 크기는 N+1입니다.
-  // (현재 시점 k=0부터 예측 종료 시점 k=N까지 총 N+1개의 상태가 필요함)
   std::vector<StateVec> x_ref(mpc_params_.N + 1);
-  // 3. 예측 지평선의 각 스텝(k)에 대해 목표 상태를 결정합니다.
-for (int k = 0; k <= mpc_params_.N; ++k) {
-    // [인덱싱 관리]
-    // 현재 인덱스에서 k만큼 떨어진 점을 가져오되, 전체 경로의 마지막 점(n-1)을 넘지 않도록 제한(std::min)합니다.
-    int idx      = std::min(closest_wp_idx_ + k, n - 1);
+
+  // ----------------------------------------------------------------
+  // [핵심 수정] 거리 기반 waypoint 인덱싱
+  //
+  // 기존: idx = closest_wp_idx_ + k
+  //   k=20, wp_spacing=0.05m → 1.0m 앞 waypoint를 reference로 잡음
+  //   v=0.1m/s, dt=0.02s → 실제 이동 가능 = 0.04m
+  //   → 25배 차이 → MPC가 엉뚱한 방향을 가리킴
+  //
+  // 수정: k스텝에서 로봇이 실제로 이동할 거리(v*dt*k)만큼
+  //       경로 위를 따라간 위치를 reference로 사용
+  //   → 경로 방향을 정확하게 따라감
+  // ----------------------------------------------------------------
+
+  // k스텝에서 예상 이동 거리: v_ref * dt * k
+  // 이 거리만큼 경로를 따라간 waypoint 인덱스를 구함
+  double step_dist = std::max(v_ref_ * mpc_params_.dt, 0.025);  // 한 스텝당 이동 거리 [m]
+
+  for (int k = 0; k <= mpc_params_.N; ++k) {
+    // k스텝 후 경로 위 목표 거리
+    double target_dist = step_dist * k;
+
+    // 현재 waypoint에서 target_dist만큼 앞의 waypoint 인덱스 탐색
+    int idx = closest_wp_idx_;
+    double accumulated = 0.0;
+
+    while (idx < n - 1) {
+      double dx = waypoints_[idx + 1](0) - waypoints_[idx](0);
+      double dy = waypoints_[idx + 1](1) - waypoints_[idx](1);
+      double seg = std::sqrt(dx * dx + dy * dy);
+      if (accumulated + seg >= target_dist) break;
+      accumulated += seg;
+      idx++;
+    }
+    idx = std::min(idx, n - 1);
     int idx_next = std::min(idx + 1, n - 1);
-    // 기본 정보(좌표, 속도 등)는 미리 저장된 waypoints_ 배열에서 복사합니다.
+
     x_ref[k] = waypoints_[idx];
 
-    // 실시간 Heading 계산
-    // -------------------------------------------------------------------------
-    // [실시간 Heading(Yaw) 및 연속성 계산]
-    // 경로 데이터에는 좌표만 있는 경우가 많으므로, 두 점 사이의 기하학적 각도를 실시간으로 계산합니다.
-    // -------------------------------------------------------------------------
-    // 현재 점과 다음 점 사이의 위치 차이를 계산합니다.
+    // 실시간 Heading 계산 + 연속성 유지
     double dx = waypoints_[idx_next](0) - waypoints_[idx](0);
     double dy = waypoints_[idx_next](1) - waypoints_[idx](1);
 
-    // 이전 x_ref yaw 기준으로 연속성 유지 (-π~π 점프 방지)
-    // [연속성 유지를 위한 기준 각도 설정]
-    // k=0(현재 시점)이면 로봇의 현재 각도(x0(2))를 기준으로 삼고,
-    // k>0이면 직전 스텝에서 계산된 목표 각도(x_ref[k-1](2))를 기준으로 삼습니다.
     double ref_yaw_base = (k == 0) ? x0(2) : x_ref[k - 1](2);
     double raw_yaw;
 
-    // 두 waypoint가 너무 가까워서 dx, dy가 0에 수렴하는 경우 방어 (atan2(0,0) 발산 방지)
-    // [수학적 특이점 방어 (Singularity Defense)]
-    // 두 점 사이의 거리가 너무 가까우면(1e-5 미만) atan2(0,0)에 의해 각도가 0으로 발산할 수 있습니다.
-    // 이 경우 방향을 정의할 수 없으므로, 이전의 기준 각도를 그대로 유지하여 급격한 회전을 방지합니다.
     if (std::abs(dx) < 1e-5 && std::abs(dy) < 1e-5) {
-      raw_yaw = ref_yaw_base; // 방향을 알 수 없으므로 직전의 헤딩을 그대로 유지
+      raw_yaw = ref_yaw_base;
     } else {
-      // 일반적인 경우, 두 점이 이루는 벡터의 탄젠트 각도를 계산합니다.
       raw_yaw = std::atan2(dy, dx);
     }
 
-    // 연속성 유지의 핵심 로직
-    // [각도 불연속성 해결 (Yaw Continuity Logic)]
-    // atan2는 -π ~ π 사이의 값만 반환하므로, 각도가 경계선을 지날 때 2π(360도)만큼 값이 튀는 현상이 발생합니다.
-    // 이를 방지하기 위해 '기준 각도'와 '계산된 각도' 사이의 최소 차이(diff)를 구합니다.
-    // sin/cos을 사용한 atan2 방식은 각도 차이를 항상 -π ~ π 범위로 정규화해 주는 표준적인 기법입니다.
     double diff = std::atan2(
       std::sin(raw_yaw - ref_yaw_base),
       std::cos(raw_yaw - ref_yaw_base));
-    // 기준 각도에 최소 차이만큼만 더해줌으로써, 각도가 경계선을 넘어도 
-    // 값이 튀지 않고 3.14 -> 3.15... 처럼 선형적으로 증가(Continuous Yaw)하게 만듭니다.
-    // 이는 선형화 MPC의 안정성을 결정짓는 가장 중요한 수치 처리 과정입니다.
     x_ref[k](2) = ref_yaw_base + diff;
   }
 

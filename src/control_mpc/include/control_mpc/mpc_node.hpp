@@ -35,6 +35,7 @@
 #include <amr_msgs/msg/safety_status.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>   // x_ref[0] → /mpc/reference_pose 발행용
 #include <amr_msgs/msg/obstacle_array.hpp>
+#include <nav_msgs/msg/path.hpp>               // 글로벌 경로계획 연동 (W12 추가)
 #include "control_mpc/mpc_core.hpp"
 #include "amr_msgs/msg/min_obstacle_distance.hpp" // w8 min clearance 발행용
 
@@ -163,6 +164,15 @@ private:
   // 클래스 private 멤버 영역에 추가
   rclcpp::Subscription<amr_msgs::msg::ObstacleArray>::SharedPtr obs_sub_;
   void obsCallback(const amr_msgs::msg::ObstacleArray::SharedPtr msg);
+
+  // --------------------------------------------------------
+  // /planned_path 콜백 (W12 글로벌 경로계획 연동)
+  //   path_planner_node가 발행한 nav_msgs/Path를 수신해
+  //   waypoints_를 교체함. 기존 hardcoded 경로 대신 사용.
+  // --------------------------------------------------------
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
+  void pathCallback(const nav_msgs::msg::Path::SharedPtr msg);
+  bool use_global_planner_ = false;  // true: /planned_path 대기, false: 하드코딩 경로
 
   // --- MPC 핵심 객체 ---
   MpcCore mpc_core_;
