@@ -27,3 +27,5 @@ Thumbs.db
 *.txt
 *.csv
 tsan*
+*.png
+*.jpg
