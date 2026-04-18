@@ -36,6 +36,9 @@ MapEkfNode::MapEkfNode(const rclcpp::NodeOptions & options)
   this->declare_parameter<double>("r_lidar_normal_yaw",   0.05);
   this->declare_parameter<double>("r_lidar_degraded_xy",  0.5);
   this->declare_parameter<double>("r_lidar_degraded_yaw", 0.5);
+  this->declare_parameter<double>("initial_x",   0.0);
+  this->declare_parameter<double>("initial_y",   0.0);
+  this->declare_parameter<double>("initial_yaw", 0.0);
 
   r_lidar_normal_xy_    = this->get_parameter("r_lidar_normal_xy").as_double();
   r_lidar_normal_yaw_   = this->get_parameter("r_lidar_normal_yaw").as_double();
@@ -372,10 +375,16 @@ void MapEkfNode::publishTimerCallback()
 // ============================================================
 void MapEkfNode::initializeEkf()
 {
+  // 변경 후
   double init_x, init_y, init_yaw;
   if (!getMapPose(init_x, init_y, init_yaw)) {
-    // TF 아직 준비 안 됨 → 다음 콜백에서 재시도
-    return;
+    // TF 조회 실패 시 파라미터로 설정된 초기 위치 사용
+    init_x   = this->get_parameter("initial_x").as_double();
+    init_y   = this->get_parameter("initial_y").as_double();
+    init_yaw = this->get_parameter("initial_yaw").as_double();
+    RCLCPP_WARN(this->get_logger(),
+      "[map_ekf_node] TF 조회 실패 — 파라미터 초기값 사용: x=%.3f, y=%.3f",
+      init_x, init_y);
   }
 
   // 초기 상태 벡터: map frame 기준 위치 + 속도 0

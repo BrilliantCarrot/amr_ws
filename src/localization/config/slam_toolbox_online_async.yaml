@@ -79,13 +79,15 @@ slam_toolbox:
     # slam 맵 생성과 위치 추정 두 개에서 모드를 다르게 사용해야 함
     # mapping:      맵을 새로 만드는 모드, mapping 일 경우 map_start_at_dock과 map_file_name을 주석처리
     # localization: 저장된 맵 위에서 위치만 추정하는 모드
-    mode: mapping
-    #  mapping일때 주석처리
+    mode: localization
+    # mode: mapping
+    # mapping일때 주석처리
     map_start_at_dock: true
     # 저장된 맵 경로 (확장자 없이 입력)
     # slam_toolbox가 .pgm + .yaml 쌍을 자동으로 로드함
-    map_file_name: /home/lyj/amr_ws/maps/amr_map
+    # map_file_name: /home/lyj/amr_ws/maps/amr_map
     # map_file_name: /home/lyj/amr_ws/maps/amr_map_empty
+    map_file_name: /home/lyj/amr_ws/maps/monte_carlo_map
 
     # ================================================================
     # [3] 일반 동작 설정
@@ -117,12 +119,6 @@ slam_toolbox:
     # 실내 5x5m 환경에서 0.05m는 적절한 선택
     resolution: 0.05
 
-    # LiDAR 최대 유효 거리 [m]
-    # 이 거리 이상의 스캔 포인트는 무시함
-    # simple_room이 5x5m이라 대각선 최대 약 7m → 6.0m로 충분히 커버
-    # 너무 크게 설정하면 노이즈 포인트까지 사용해서 맵 품질 저하
-    max_laser_range: 6.0
-
     # 연속된 스캔 처리 사이의 최소 시간 간격 [초]
     # 0.5s: 0.5초 미만 간격으로 들어온 스캔은 처리 건너뜀
     # 로봇이 제자리에 서 있을 때 불필요한 처리를 막는 역할
@@ -139,6 +135,12 @@ slam_toolbox:
     # 30초면 충분히 여유 있는 값
     tf_buffer_duration: 30.0
 
+    # LiDAR 최대 유효 거리 [m]
+    # 이 거리 이상의 스캔 포인트는 무시함
+    # simple_room이 5x5m이라 대각선 최대 약 7m → 6.0m로 충분히 커버
+    # 너무 크게 설정하면 노이즈 포인트까지 사용해서 맵 품질 저하
+    max_laser_range: 3.5
+
     # ================================================================
     # [4] 루프 클로저 설정
     #
@@ -152,6 +154,28 @@ slam_toolbox:
     #   오도메트리만으로는 시작점과 현재 위치가 약간 어긋남.
     #   루프 클로저가 이 어긋남을 감지하고 전체 경로를 보정함.
     # ================================================================
+
+    # 루프 클로저 coarse 단계의 최소 응답값
+    # 0.35 이상이어야 coarse 단계 통과 → fine 단계로 진행
+    loop_match_minimum_response_coarse: 0.7  # 0.35 → 0.55
+    # 루프 클로저 fine 단계의 최소 응답값
+    # 0.45 이상이어야 최종적으로 루프 클로저로 확정
+    # coarse보다 높게 설정 → 두 단계를 거쳐 정확도 보장
+    loop_match_minimum_response_fine: 0.8    # 0.45 → 0.65
+    # 루프 클로저로 인정하기 위한 최소 체인 길이
+    # 과거 스캔들이 최소 10개 이상 연속으로 이어져야 루프로 인정
+    # 너무 작으면 오탐(false positive) 루프 클로저 발생
+    loop_match_minimum_chain_size: 15         # 10 → 15
+    # 인접 스캔 간 최대 허용 거리 [m]
+    # 1.5m 이상 떨어진 스캔끼리는 연결하지 않음
+    # 너무 크면 엉뚱한 스캔이 연결될 수 있음
+    link_scan_maximum_distance: 0.8           # 1.5 → 1.0
+    # 최소 이동 거리 줄임 → 더 자주 스캔 추가해서 드리프트 방지
+    # 새 스캔을 처리하기 위한 최소 이동 거리 [m]
+    # 0.2m 이상 이동했을 때만 새 스캔을 맵에 추가
+    # 너무 작으면 제자리에서 불필요한 스캔을 계속 추가해서 맵이 지저분해짐
+    # 너무 크면 맵 업데이트가 느려짐
+    minimum_travel_distance: 0.1  # 0.2 → 0.1
 
     # rviz에서 slam_toolbox 플러그인으로 수동 개입 가능 여부
     # true: 맵의 특정 노드를 rviz에서 직접 조작 가능 (디버그용)
@@ -177,12 +201,6 @@ slam_toolbox:
     # false: 로봇 위치를 기준으로 매칭
     use_scan_barycenter: true
 
-    # 새 스캔을 처리하기 위한 최소 이동 거리 [m]
-    # 0.2m 이상 이동했을 때만 새 스캔을 맵에 추가
-    # 너무 작으면 제자리에서 불필요한 스캔을 계속 추가해서 맵이 지저분해짐
-    # 너무 크면 맵 업데이트가 느려짐
-    minimum_travel_distance: 0.2
-
     # 새 스캔을 처리하기 위한 최소 회전 각도 [rad]
     # 0.2rad ≈ 11.5도 이상 회전했을 때만 새 스캔 추가
     # minimum_travel_distance와 OR 조건: 둘 중 하나라도 충족하면 처리
@@ -203,11 +221,6 @@ slam_toolbox:
     # 너무 높으면 매칭이 자주 실패, 너무 낮으면 잘못된 매칭 허용
     link_match_minimum_response_fine: 0.1
 
-    # 인접 스캔 간 최대 허용 거리 [m]
-    # 1.5m 이상 떨어진 스캔끼리는 연결하지 않음
-    # 너무 크면 엉뚱한 스캔이 연결될 수 있음
-    link_scan_maximum_distance: 1.5
-
     # 루프 클로저 후보를 탐색하는 최대 거리 [m]
     # 현재 위치에서 3.0m 이내의 과거 스캔들을 루프 클로저 후보로 검토
     # simple_room 5x5m에서 3.0m면 반대편 벽까지 커버
@@ -218,24 +231,10 @@ slam_toolbox:
     # false: 루프 클로저 없이 오도메트리 + 스캔 매칭만
     do_loop_closing: true
 
-    # 루프 클로저로 인정하기 위한 최소 체인 길이
-    # 과거 스캔들이 최소 10개 이상 연속으로 이어져야 루프로 인정
-    # 너무 작으면 오탐(false positive) 루프 클로저 발생
-    loop_match_minimum_chain_size: 10
-
     # 루프 클로저 coarse 단계의 최대 허용 분산
     # coarse 단계: 대략적인 위치에서 빠르게 후보를 걸러내는 단계
     # 분산이 3.0 이하인 후보만 fine 단계로 넘김
     loop_match_maximum_variance_coarse: 3.0
-
-    # 루프 클로저 coarse 단계의 최소 응답값
-    # 0.35 이상이어야 coarse 단계 통과 → fine 단계로 진행
-    loop_match_minimum_response_coarse: 0.35
-
-    # 루프 클로저 fine 단계의 최소 응답값
-    # 0.45 이상이어야 최종적으로 루프 클로저로 확정
-    # coarse보다 높게 설정 → 두 단계를 거쳐 정확도 보장
-    loop_match_minimum_response_fine: 0.45
 
     # ================================================================
     # [6] 상관 기반 스캔 매칭 파라미터

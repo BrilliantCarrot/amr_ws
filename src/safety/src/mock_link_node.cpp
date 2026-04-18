@@ -163,6 +163,16 @@ void MockLinkNode::cmdVelCallback(const geometry_msgs::msg::Twist::SharedPtr msg
   //   shouldDrop()이 true면 이 패킷을 버리고 리턴
   if (shouldDrop()) {
     ++stat_dropped_;
+
+    // 드롭 시 zero velocity 발행 — Gazebo가 이전 명령을 유지하는 것을 방지
+    // 실제 통신 드롭은 패킷이 사라지는 것이지만,
+    // Gazebo 브릿지 특성상 마지막 값을 유지하므로
+    // 드롭을 모사하려면 명시적으로 정지 명령을 보내야 함
+    geometry_msgs::msg::Twist zero_msg;
+    zero_msg.linear.x  = 0.0;
+    zero_msg.angular.z = 0.0;
+    cmd_pub_->publish(zero_msg);
+
     RCLCPP_DEBUG(this->get_logger(),
       "[MockLink] 패킷 드롭 (총 드롭: %lu / %lu)", stat_dropped_, stat_total_rx_);
     return;

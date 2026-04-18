@@ -545,18 +545,33 @@ void MpcCore::buildQP(
       // CV(Constant Velocity) 모델로 k스텝 후 장애물 위치 예측
       // t_pred = k * dt : k스텝 후의 경과 시간 [s]
       // 정적 장애물(vx=vy=0): pred = obs.x/y (변화 없음, W8 동작과 동일)
-      int pred_k = std::min(k, 5);
-      double pred_ox = obs.x + safe_vx * (pred_k * params_.dt);
-      double pred_oy = obs.y + safe_vy * (pred_k * params_.dt);
+      // int pred_k = std::min(k, 5);
+      // double pred_ox = obs.x + safe_vx * (pred_k * params_.dt);
+      // double pred_oy = obs.y + safe_vy * (pred_k * params_.dt);
 
-      // 로봇(예측 위치) → 장애물(예측 위치) 벡터
-      double dx    = px - pred_ox;  // (로봇 - 장애물) x, 양수=로봇이 오른쪽
-      double dy    = py - pred_oy;  // (로봇 - 장애물) y, 양수=로봇이 위
-      double d     = std::sqrt(dx * dx + dy * dy);         // 중심 간 거리
-      double d_eff = std::max(d - obs.radius, 1e-6);       // 표면 간 거리 (반경 보정)
+      // // 로봇(예측 위치) → 장애물(예측 위치) 벡터
+      // double dx    = px - pred_ox;  // (로봇 - 장애물) x, 양수=로봇이 오른쪽
+      // double dy    = py - pred_oy;  // (로봇 - 장애물) y, 양수=로봇이 위
+      // double d     = std::sqrt(dx * dx + dy * dy);         // 중심 간 거리
+      // double d_eff = std::max(d - obs.radius, 1e-6);       // 표면 간 거리 (반경 보정)
+
+      // 보수적 버블 전략: CV 예측 대신 현재 위치 기준 팽창 반경 사용
+      // 방향 전환 시 CV 예측이 실패하는 문제를 근본 해결
+      // 버블 반경 = obs.radius + obs_speed * t_pred (최대 0.5m 팽창)
+      double obs_speed_bubble = std::hypot(safe_vx, safe_vy);
+      double t_pred  = std::min(k, 5) * params_.dt;
+      double bubble_extra = std::min(obs_speed_bubble * t_pred, 0.5);
+
+      double pred_ox = obs.x;  // 현재 위치 사용 (CV 예측 제거)
+      double pred_oy = obs.y;
+
+      double dx    = px - pred_ox;
+      double dy    = py - pred_oy;
+      double d     = std::sqrt(dx * dx + dy * dy);
+      double d_eff = std::max(d - obs.radius - bubble_extra, 1e-6);
 
       // 동적 장애물 판별: 추정 속도가 0.15 m/s 초과이면 동적으로 처리
-      double obs_speed = std::hypot(safe_vx, safe_vy);
+      double obs_speed = obs_speed_bubble;
       bool is_dynamic  = (obs_speed > 0.15);
 
       // ── 정적 장애물 전용: 뒤끝 페널티 제거 ──────────────────────

@@ -6,7 +6,7 @@
 #include <queue>
 #include <vector>
 
-namespace planning
+namespace planning{
 
 // ============================================================
 // inflateMap() — 장애물 팽창 (Obstacle Inflation)

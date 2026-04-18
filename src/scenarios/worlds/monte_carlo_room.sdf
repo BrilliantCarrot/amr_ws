@@ -1,0 +1,237 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+  <!-- ================================================================
+       monte_carlo_room.sdf — W12 Monte Carlo 통합 테스트 월드
+
+       [좌표계 설명]
+         로봇 스폰: (0, 0) = MAP frame 원점
+         모든 좌표는 MAP frame 기준 (기존 Gazebo 좌표 + 2.5 적용)
+
+       [방 구조]
+         크기: 6m × 6m (x: -3~+3, y: -0.5~+5.5)
+         Start: (0,   0)  — 방 하단 중앙 (MAP frame 원점)
+         Goal:  (0, 4.5)  — 방 상단 중앙
+
+       [ㄹ자 통로 격벽 2개]
+         격벽B (y=+1.0): x=-1.7 ~ +3.0  왼쪽 1.3m 열림 (x=-3.0 ~ -1.7)
+         격벽A (y=+2.0): x=-3.0 ~ +1.7  오른쪽 1.3m 열림 (x=+1.7 ~ +3.0)
+
+       [장애물]
+         정적: static_obs  (1.5, 4.5)  — Goal 앞 정적 장애물
+         동적: dyn_obs_1   (-2.5, 4.0) — x축 왕복 y=4.0 고정 (0.2 m/s)
+               dyn_obs_2   (2.5,  5.0) — x축 왕복 y=5.0 고정 (위상 반전)
+
+       [obstacle_controller_node.py 설정]
+         dyn_obs_1: x=-2.5 ~ +2.5, y=4.0 고정, period=50s
+         dyn_obs_2: x=+2.5 ~ -2.5, y=5.0 고정, period=50s (위상차 25s)
+
+       ⚠️ world name="simple_room" 유지 필수
+          bringup.launch.py spawn 서비스 경로와 일치해야 함
+       사용: ros2 launch scenarios bringup.launch.py world:=monte_carlo_room \
+             use_planner:=true goal_x:=0.0 goal_y:=4.5
+       ================================================================ -->
+  <world name="simple_room">
+
+    <!-- 물리 엔진 -->
+    <physics name="default_physics" type="ode">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <!-- 시스템 플러그인 -->
+    <plugin filename="libignition-gazebo-physics-system.so"
+            name="ignition::gazebo::systems::Physics"/>
+    <plugin filename="libignition-gazebo-sensors-system.so"
+            name="ignition::gazebo::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <plugin filename="libignition-gazebo-scene-broadcaster-system.so"
+            name="ignition::gazebo::systems::SceneBroadcaster"/>
+    <!-- UserCommands: /world/simple_room/set_pose 서비스 제공 -->
+    <plugin filename="libignition-gazebo-user-commands-system.so"
+            name="ignition::gazebo::systems::UserCommands"/>
+    <plugin filename="libignition-gazebo-imu-system.so"
+            name="ignition::gazebo::systems::Imu"/>
+
+    <!-- 조명 -->
+    <light name="sun" type="directional">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 2.5 10 0 0 0</pose>
+      <diffuse>1 1 1 1</diffuse>
+      <specular>0.5 0.5 0.5 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <!-- 바닥 -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane>
+            <normal>0 0 1</normal>
+            <size>20 20</size>
+          </plane></geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ================================================================
+         외벽 4개
+         x: -3.0 ~ +3.0 (폭 6m)
+         y: -0.5 ~ +5.5 (높이 6m)
+         두께 0.1m, 높이 1.0m
+         ================================================================ -->
+
+    <!-- 북벽: y=+5.55, 길이 6.2m -->
+    <model name="wall_north">
+      <static>true</static>
+      <pose>0 5.55 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>6.2 0.1 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>6.2 0.1 1.0</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 남벽: y=-0.55, 길이 6.2m -->
+    <model name="wall_south">
+      <static>true</static>
+      <pose>0 -0.55 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>6.2 0.1 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>6.2 0.1 1.0</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 동벽: x=+3.05, 길이 6.2m (y 중심: (-0.5+5.5)/2 = 2.5) -->
+    <model name="wall_east">
+      <static>true</static>
+      <pose>3.05 2.5 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.1 6.2 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.1 6.2 1.0</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 서벽: x=-3.05, 길이 6.2m -->
+    <model name="wall_west">
+      <static>true</static>
+      <pose>-3.05 2.5 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.1 6.2 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.1 6.2 1.0</size></box></geometry>
+          <material><ambient>0.5 0.5 0.5 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ================================================================
+         ㄹ자 통로 격벽 2개
+
+         격벽B (y=+1.0): x=-1.7 ~ +3.0, 길이=4.7m, 중심x=+0.65
+                         왼쪽 1.3m 열림 (x=-3.0 ~ -1.7)
+         격벽A (y=+2.0): x=-3.0 ~ +1.7, 길이=4.7m, 중심x=-0.65
+                         오른쪽 1.3m 열림 (x=+1.7 ~ +3.0)
+         두께 0.2m (SLAM 인식 보장), 높이 1.0m
+         ================================================================ -->
+
+    <!-- 격벽B (y=+1.0) -->
+    <model name="partition_B">
+      <static>true</static>
+      <pose>1 1.2 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>4.7 0.2 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>4.7 0.2 1.0</size></box></geometry>
+          <material><ambient>0.3 0.5 0.8 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- 격벽A (y=+2.0) -->
+    <model name="partition_A">
+      <static>true</static>
+      <pose>-2.0 2.7 0.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>4.7 0.2 1.0</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>4.7 0.2 1.0</size></box></geometry>
+          <material><ambient>0.3 0.5 0.8 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ================================================================
+         정적 장애물 — Goal 앞 공간
+         위치: (1.5, 4.5), 크기: 0.4×0.4×0.8
+         ================================================================ -->
+    <model name="static_obs">
+      <static>true</static>
+      <pose>1.5 4.5 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.4 0.4 0.8</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.4 0.4 0.8</size></box></geometry>
+          <material>
+            <ambient>0.8 0.2 0.2 1</ambient>
+            <diffuse>0.8 0.2 0.2 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- ================================================================
+         동적 장애물 1 — dyn_obs_1 (초록)
+         초기: (-2.5, 4.0, 0.4)
+         왕복: x=-2.5 ~ +2.5, y=4.0 고정, 0.2 m/s → period=50s
+         ================================================================ -->
+    <model name="dyn_obs_1">
+      <static>true</static>
+      <pose>-1.5 3.5 0.4 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.3 0.3 0.8</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.3 0.3 0.8</size></box></geometry>
+          <material>
+            <ambient>0.2 0.8 0.2 1</ambient>
+            <diffuse>0.2 0.8 0.2 1</diffuse>
+            <emissive>0.0 0.2 0.0 1</emissive>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>

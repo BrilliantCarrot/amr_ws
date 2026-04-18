@@ -161,6 +161,10 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   min_dist_pub_ = this->create_publisher<amr_msgs::msg::MinObstacleDistance>(
     "/metrics/min_obstacle_distance", rclcpp::QoS(10).reliable());
 
+  // 긴급 정지용 publisher — Gazebo 브릿지 직접 연결
+  emergency_stop_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
+    "/cmd_vel_delayed", rclcpp::QoS(10).reliable());
+
   // --- 50Hz 제어 타이머 ---
   // dt = 20ms 주기로 controlCallback() 호출
   control_timer_ = this->create_wall_timer(
@@ -249,37 +253,87 @@ void MpcNode::safetyStateCallback(
   safety_state_ = msg->state;
 }
 
-// 소스 하단에 콜백 함수 구현
+// void MpcNode::obsCallback(const amr_msgs::msg::ObstacleArray::SharedPtr msg)
+// {
+//   std::lock_guard<std::mutex> lock(state_mutex_);
+
+//   // ---------------------------------------------------------------
+//   // 글로벌 경로계획 모드(use_global_planner=true)에서는
+//   // 장애물 회피를 path_planner_node(A*)가 전담하므로
+//   // MPC에 obstacle penalty를 전달하지 않음.
+//   //
+//   // [역할 분리 원칙]
+//   //   path_planner_node : 경로계획 + 장애물 회피 (정적/동적 모두)
+//   //   mpc_node          : 순수 경로 추종만 담당
+//   //
+//   // MPC가 동시에 obstacle penalty를 적용하면:
+//   //   A*가 만든 회피 경로 ↔ MPC penalty 방향이 충돌
+//   //   → QP infeasible → solve 실패 반복
+//   // ---------------------------------------------------------------
+//   if (use_global_planner_) {
+//     return;
+//   }
+
+//   // 하드코딩 모드(use_global_planner=false)에서만 기존 동작 유지
+//   constexpr double ROBOT_RADIUS = 0.2;
+//   // 로봇을 점(point)으로 취급하는 대신, 장애물 반경을 미리 로봇 반경만큼 키워두는 트릭
+//   // path_planner_node의 inflateMap()과 동일한 개념
+//   obstacles_.clear(); // 새 메시지가 올 때마다 이전 프레임을 지우고 장애물을 최신 상태로 갱신
+//   // 왜? 로봇이 움직이면서 장애물 위치도 상대적으로 움직이기 때문
+//   // 안하면, 로봇이 사라진 장애물이 여전히 있다고 인식해서 불필요하게 회피하거나 경로가 이상해짐
+//   // 장애물 반경 팽창 후 저장
+//   for (int i = 0; i < msg->count; ++i) {
+//     Obstacle obs;
+//     obs.x      = msg->x[i];
+//     obs.y      = msg->y[i];
+//     obs.radius = msg->radius[i] + ROBOT_RADIUS;
+//     obs.vx     = msg->vx[i];
+//     obs.vy     = msg->vy[i];
+//     obstacles_.push_back(obs);
+//   }
+//   mpc_core_.setObstacles(obstacles_); // 가공된 장애물 목록을 MPC 코어에 넘김
+//   // 왜 use_global_planner=false 일 때만:
+//   // use_global_planner=true(A* 연동 모드)에서는 path_planner_node가 이미 장애물을 맵에 마킹하고 회피 경로를 만들어서 
+//   // /planned_path로 줌. MPC는 그 경로를 그냥 추종하면 되므로 별도로 장애물을 받을 필요가 없음 
+//   // 반면 하드코딩 모드에서는 전역 경로 계획이 없으므로 MPC가 직접 장애물을 인식해서 회피해
+
+//   if (!obstacles_.empty()) {
+//     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+//       "장애물 %zu개 수신 중...", obstacles_.size());
+//   }
+// }
+
 void MpcNode::obsCallback(const amr_msgs::msg::ObstacleArray::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(state_mutex_);
 
-  // ---------------------------------------------------------------
-  // 글로벌 경로계획 모드(use_global_planner=true)에서는
-  // 장애물 회피를 path_planner_node(A*)가 전담하므로
-  // MPC에 obstacle penalty를 전달하지 않음.
-  //
-  // [역할 분리 원칙]
-  //   path_planner_node : 경로계획 + 장애물 회피 (정적/동적 모두)
-  //   mpc_node          : 순수 경로 추종만 담당
-  //
-  // MPC가 동시에 obstacle penalty를 적용하면:
-  //   A*가 만든 회피 경로 ↔ MPC penalty 방향이 충돌
-  //   → QP infeasible → solve 실패 반복
-  // ---------------------------------------------------------------
-  if (use_global_planner_) {
-    return;
-  }
-
-  // 하드코딩 모드(use_global_planner=false)에서만 기존 동작 유지
   constexpr double ROBOT_RADIUS = 0.2;
-  // 로봇을 점(point)으로 취급하는 대신, 장애물 반경을 미리 로봇 반경만큼 키워두는 트릭
-  // path_planner_node의 inflateMap()과 동일한 개념
-  obstacles_.clear(); // 새 메시지가 올 때마다 이전 프레임을 지우고 장애물을 최신 상태로 갱신
-  // 왜? 로봇이 움직이면서 장애물 위치도 상대적으로 움직이기 때문
-  // 안하면, 로봇이 사라진 장애물이 여전히 있다고 인식해서 불필요하게 회피하거나 경로가 이상해짐
-  // 장애물 반경 팽창 후 저장
+  // 동적 장애물 판별 속도 임계값 [m/s]
+  // EMA 필터(α=0.08) 특성상 정지 장애물도 초기 몇 프레임은
+  // 속도가 튈 수 있으므로 0.05보다 약간 높은 0.08로 설정
+  constexpr double DYNAMIC_SPEED_THRESH = 0.08;
+
+  obstacles_.clear();
+
   for (int i = 0; i < msg->count; ++i) {
+    double speed = std::hypot(msg->vx[i], msg->vy[i]);
+
+    if (use_global_planner_) {
+      // ---------------------------------------------------------------
+      // 글로벌 경로계획 모드: 동적 장애물만 MPC에 전달
+      //
+      // [역할 분리]
+      //   정적 장애물 → A*가 inflated 맵에서 전담 회피
+      //   동적 장애물 → MPC penalty로 실시간 회피
+      //
+      // A*가 경로를 재계획하는 주기(2~3초) 사이의 공백에서
+      // 동적 장애물이 경로에 침범할 수 있으므로
+      // MPC가 실시간으로 penalty를 적용해 회피함
+      // ---------------------------------------------------------------
+      if (speed < DYNAMIC_SPEED_THRESH) continue; // 정적 장애물 스킵
+    }
+    // use_global_planner_=false이면 기존처럼 전체 장애물 처리
+
     Obstacle obs;
     obs.x      = msg->x[i];
     obs.y      = msg->y[i];
@@ -288,15 +342,14 @@ void MpcNode::obsCallback(const amr_msgs::msg::ObstacleArray::SharedPtr msg)
     obs.vy     = msg->vy[i];
     obstacles_.push_back(obs);
   }
-  mpc_core_.setObstacles(obstacles_); // 가공된 장애물 목록을 MPC 코어에 넘김
-  // 왜 use_global_planner=false 일 때만:
-  // use_global_planner=true(A* 연동 모드)에서는 path_planner_node가 이미 장애물을 맵에 마킹하고 회피 경로를 만들어서 
-  // /planned_path로 줌. MPC는 그 경로를 그냥 추종하면 되므로 별도로 장애물을 받을 필요가 없음 
-  // 반면 하드코딩 모드에서는 전역 경로 계획이 없으므로 MPC가 직접 장애물을 인식해서 회피해
+
+  mpc_core_.setObstacles(obstacles_);
 
   if (!obstacles_.empty()) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "장애물 %zu개 수신 중...", obstacles_.size());
+      "[MPC] 장애물 수신: 전체=%d, MPC 전달=%zu (동적 필터 적용: %s)",
+      msg->count, obstacles_.size(),
+      use_global_planner_ ? "ON" : "OFF");
   }
 }
 
@@ -941,6 +994,12 @@ void MpcNode::publishStop()
   msg.linear.x  = 0.0;
   msg.angular.z = 0.0;
   cmd_vel_pub_->publish(msg);
+
+  // /cmd_vel_delayed 직접 발행 (Gazebo 브릿지 직접 연결)
+  // → mock_link delay_queue를 우회해서 Gazebo에 즉시 zero 전달
+  // → SAFE_STOP, localization LOST 등 긴급 상황에서 즉시 정지 보장
+  emergency_stop_pub_->publish(msg);
+
 
   // [원리 설명]
   // 이전 입력 초기화 및 남아있는 지연 명령 싹 비우기

@@ -31,7 +31,7 @@ LocalizationMonitorNode::LocalizationMonitorNode(const rclcpp::NodeOptions & opt
   //   window_size:      RMSE 슬라이딩 윈도우 크기 (샘플 수)
   //   robot_name:       Ground Truth 추출 시 child_frame_id
   // --------------------------------------------------------
-  this->declare_parameter<double>("tf_timeout_sec",    2.0);
+  this->declare_parameter<double>("tf_timeout_sec",    1.0);
   this->declare_parameter<double>("tf_jump_thresh_m",  0.3);
   this->declare_parameter<int>   ("window_size",       100);
   this->declare_parameter<std::string>("robot_name",  "amr_robot");

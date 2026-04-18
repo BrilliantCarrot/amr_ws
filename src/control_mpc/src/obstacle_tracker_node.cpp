@@ -60,6 +60,16 @@ public:
   // tf_listener_: /tf, /tf_static 토픽을 구독해 tf_buffer_를 자동으로 채움
   // ──────────────────────────────────────────────────────────
   ObstacleTrackerNode() : Node("obstacle_tracker_node"), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_) {
+    // 맵 크기 파라미터 — 벽 필터링 기준 (벽 위치 - 여유 0.1m)
+    // 기본값 2.9 = 6×6m 방 기준 (±3.0m 벽 - 0.1m)
+    this->declare_parameter("map_boundary", 2.9);
+    // 장애물 매칭 거리 임계값 [m]
+    // 기본값 0.5 = 속도 0.2m/s 기준 충분한 여유
+    this->declare_parameter("match_dist_thresh", 0.5);
+
+    map_boundary_      = this->get_parameter("map_boundary").as_double();
+    match_dist_thresh_ = this->get_parameter("match_dist_thresh").as_double();
+
     // [설정] QoS는 LiDAR 센서 데이터에 맞춰 SensorDataQoS를 사용합니다.
     // SensorDataQoS = BEST_EFFORT + 소규모 히스토리
     // Gazebo의 /scan 브릿지도 BEST_EFFORT로 발행하므로 QoS를 맞춰야 연결됨.
@@ -131,7 +141,8 @@ private:
       // 방 경계(2.3m) 외곽은 무시합니다.
       // simple_room(5×5m) 기준 중심에서 ±2.5m가 최대이므로
       // 2.1m로 제한해서 벽 포인트가 클러스터링에 섞이지 않도록 차단
-      if (std::abs(pt_map.point.x) > 2.1 || std::abs(pt_map.point.y) > 2.1) continue;
+      if (std::abs(pt_map.point.x) > map_boundary_ ||
+          pt_map.point.y < -0.5 || pt_map.point.y > 5.8) continue;
       valid_points.push_back({pt_map.point.x, pt_map.point.y});
     }
 
@@ -192,12 +203,14 @@ private:
       double max_d = 0;
       for (const auto& p : cluster) max_d = std::max(max_d, std::hypot(p.first-cx, p.second-cy));
       double radius = max_d; // 여유분 축소
+      // 추가: 반경 0.6m 초과 = 격벽/벽 클러스터 → 스킵
+      if (radius > 0.6) continue;
 
       // 이전 프레임 장애물과 매칭 (최근접 이웃 탐색)
       // matched_idx: 매칭된 이전 장애물의 인덱스 (-1이면 새 장애물)
       // min_match_dist: 탐색 중 발견된 최소 거리 (초기값 = 허용 최대 거리)
       int matched_idx = -1;
-      double min_match_dist = 0.8;
+      double min_match_dist = match_dist_thresh_;
       for (size_t i = 0; i < tracked_obstacles_.size(); ++i) {
         double d = std::hypot(cx - tracked_obstacles_[i].x, cy - tracked_obstacles_[i].y);
         if (d < min_match_dist) { min_match_dist = d; matched_idx = i; }
@@ -266,6 +279,8 @@ private:
   rclcpp::Publisher<amr_msgs::msg::ObstacleArray>::SharedPtr obs_pub_;     // /obstacles/detected 발행자
   std::vector<TrackedObs> tracked_obstacles_;  // 현재 추적 중인 장애물 목록 (프레임 간 유지됨)
   int next_id_ = 0;  // 장애물 ID 카운터 (새 장애물 등장마다 1씩 증가, 디버깅용)
+  double map_boundary_      = 2.9;
+  double match_dist_thresh_ = 0.5;
 };
 }
 

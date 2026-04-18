@@ -25,6 +25,7 @@
 #include <amr_msgs/msg/obstacle_array.hpp>
 
 #include "planning/astar.hpp"
+#include <amr_msgs/msg/localization_status.hpp>
 
 namespace planning
 {
@@ -72,6 +73,9 @@ private:
   rclcpp::Subscription<amr_msgs::msg::ObstacleArray>::SharedPtr   obs_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr                path_pub_;
   rclcpp::TimerBase::SharedPtr                                     replan_timer_;
+  rclcpp::Subscription<amr_msgs::msg::LocalizationStatus>::SharedPtr loc_sub_;
+  void locCallback(const amr_msgs::msg::LocalizationStatus::SharedPtr msg);
+  uint8_t loc_status_{0};  // 0=NORMAL, 1=DEGRADED, 2=LOST
 
   // 상태 변수 (SingleThread → mutex 불필요)
   nav_msgs::msg::OccupancyGrid map_;

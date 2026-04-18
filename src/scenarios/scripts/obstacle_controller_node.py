@@ -65,11 +65,11 @@ class ObstacleControllerNode(Node):
                     '-s', '/world/simple_room/set_pose',
                     '--reqtype', 'ignition.msgs.Pose',
                     '--reptype', 'ignition.msgs.Boolean',
-                    '--timeout', '2000',   # 500 → 2000ms
+                    '--timeout', '500',   # 500 → 2000ms
                     '--req', req,
                 ],
                 capture_output=True,
-                timeout=3.0,             # 1.0 → 3.0s
+                timeout=1.0,             # 1.0 → 3.0s
             )
         except subprocess.TimeoutExpired:
             self.get_logger().warn(
@@ -83,42 +83,37 @@ class ObstacleControllerNode(Node):
     # _control_callback() — 5Hz 제어 루프
     # ---------------------------------------------------------------
     def _control_callback(self):
-        """5Hz — 콜백당 장애물 1개씩 번갈아 호출 (동시 ign service 방지)"""
         if not self.ready:
             return
 
         elapsed = (self.get_clock().now() - self.t_start).nanoseconds / 1e9
 
-        period1 = 80.0
+        # dyn_obs_1: y=1.5 고정, x=-2.5 ~ +2.5 왕복 (0.2 m/s)
+        # period = 5m / 0.2 m/s = 25s
+        period1 = 125.0
         phase1 = (elapsed % period1) / period1
         if phase1 < 0.5:
-            y1 = -1.5 + (phase1 / 0.5) * 3.0
+            x1 = -2.5 + (phase1 / 0.5) * 5.0
         else:
-            y1 = 1.5 - ((phase1 - 0.5) / 0.5) * 3.0
-        self._set_pose_sync('dyn_obs_1', 0.5, y1, 0.4)
+            x1 = 2.5 - ((phase1 - 0.5) / 0.5) * 5.0
 
-        # if self._obs_turn == 0:
-        #     # dyn_obs_1: x=0.5, y축 왕복 0.30 m/s
-        #     period1 = 40.0
-        #     phase1 = (elapsed % period1) / period1
-        #     if phase1 < 0.5:
-        #         y1 = -1.5 + (phase1 / 0.5) * 3.0
-        #     else:
-        #         y1 = 1.5 - ((phase1 - 0.5) / 0.5) * 3.0
-        #     self._set_pose_sync('dyn_obs_1', 0.5, y1, 0.4)
+        # daemon thread로 비동기 실행 — ROS2 실행기 블로킹 방지
+        threading.Thread(
+            target=self._set_pose_sync,
+            args=('dyn_obs_1', x1, 3.5, 0.4),
+            daemon=True
+        ).start()
+
+        # self._set_pose_sync('dyn_obs_1', x1, 1.5, 0.4)
+
+        # dyn_obs_2: y=2.5 고정, x=+2.5 ~ -2.5 왕복 (위상 반전)
+        # period2 = 25.0
+        # phase2 = ((elapsed + 12.5) % period2) / period2
+        # if phase2 < 0.5:
+        #     x2 = -2.5 + (phase2 / 0.5) * 5.0
         # else:
-        #     pass
-        #     # dyn_obs_2: x=1.5, y축 왕복 0.16 m/s
-        #     period2 = 40.0
-        #     phase2 = ((elapsed + 10.0) % period2) / period2
-        #     if phase2 < 0.5:
-        #         y2 = 0.8 - (phase2 / 0.5) * 1.6
-        #     else:
-        #         y2 = -0.8 + ((phase2 - 0.5) / 0.5) * 1.6
-        #     self._set_pose_sync('dyn_obs_2', 1.5, y2, 0.4)
-
-        # self._obs_turn = 1 - self._obs_turn  # 0→1→0 토글
-
+        #     x2 = 2.5 - ((phase2 - 0.5) / 0.5) * 5.0
+        # self._set_pose_sync('dyn_obs_2', x2, 2.5, 0.4)
 
 def main(args=None):
     rclpy.init(args=args)

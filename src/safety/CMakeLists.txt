@@ -36,7 +36,7 @@ add_executable(mock_link_node
   src/mock_link_node.cpp
 )
 ament_target_dependencies(mock_link_node
-  rclcpp std_msgs geometry_msgs
+  rclcpp std_msgs geometry_msgs amr_msgs
 )
 target_include_directories(mock_link_node PUBLIC include)
 

@@ -24,7 +24,7 @@ Thumbs.db
 *.gv
 *.pdf
 *.pgm
-*.txt
+
 *.csv
 tsan*
 *.png

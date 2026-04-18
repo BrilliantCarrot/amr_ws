@@ -71,12 +71,14 @@ def launch_setup(context, *args, **kwargs):
                     '--timeout', '5000',
                     '--req',
                     f'sdf_filename: "{sdf_out}", name: "amr_robot", '
-                    f'pose: {{position: {{x: 0, y: 0.0, z: 0.3}}}}'
+                    f'pose: {{position: {{x: 0, y: 0, z: 0.1}},'
+                    f'orientation: {{x: 0, y: 0, z: 0.0, w: 1.0}}}}'
                 ],
                 output='screen'
             )
         ]
     )
+    # 기본 simple_room 들의 경우엔 f'orientation을 지우고, f'pose: {{position: {{x: 0, y: 0, z: 0.3}}}}'
 
     # --------------------------------------------------------
     # W11 Step1: mock_link 활성화 여부에 따라 브릿지 YAML 분기
@@ -201,7 +203,7 @@ def launch_setup(context, *args, **kwargs):
                 f'--ros-args '
                 f'-p goal_x:={goal_x_val} '
                 f'-p goal_y:={goal_y_val} '
-                f'-p robot_radius:=0.7 '
+                f'-p robot_radius:=0.55 '
                 f'-p replan_period_sec:=2.0 '
                 f'-p replan_obs_dist:=0.5 '
                 f'-p wp_spacing:=0.05 '

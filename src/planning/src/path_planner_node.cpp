@@ -4,7 +4,7 @@
 #include <chrono>
 #include <cmath>
 
-namespace planning
+namespace planning{
 
 // ============================================================
 // PathPlannerNode 생성자
@@ -94,6 +94,15 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
     "/obstacles/detected", qos_reliable,
     std::bind(&PathPlannerNode::obstacleCallback, this, std::placeholders::_1));
 
+  loc_sub_ = this->create_subscription<amr_msgs::msg::LocalizationStatus>(
+    "/localization/status", qos_reliable,
+    std::bind(&PathPlannerNode::locCallback, this, std::placeholders::_1));
+
+
+
+
+
+
   // /planned_path 발행: 후처리(스무딩+재샘플링)된 경로를 MPC 노드에 전달
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
     "/planned_path", qos_reliable);
@@ -109,6 +118,12 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
     "[PathPlanner] 초기화 완료 | goal=(%.2f, %.2f) | "
     "robot_r=%.2fm | replan=%.1fs | wp_spacing=%.2fm",
     goal_x_, goal_y_, robot_radius_, replan_period_sec_, wp_spacing_);
+}
+
+void PathPlannerNode::locCallback(
+  const amr_msgs::msg::LocalizationStatus::SharedPtr msg)
+{
+  loc_status_ = msg->status;
 }
 
 // ============================================================
@@ -275,6 +290,14 @@ void PathPlannerNode::replanTimerCallback()
 // ============================================================
 bool PathPlannerNode::plan()
 {
+  // localization LOST 상태에서는 계획 스킵
+  // 맵 좌표계가 깨진 상태에서 A*를 돌리면 엉뚱한 경로 생성
+  if (loc_status_ == 2) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+      "[PathPlanner] localization LOST — 경로 계획 스킵");
+    return false;
+  }
+
   // Step 1: 필수 데이터 준비 여부 확인
   if (!has_map_ || !has_odom_ || !has_goal_) return false;
 
@@ -567,34 +590,55 @@ bool PathPlannerNode::hasLineOfSight(
   const std::vector<int8_t> & grid, int w, int h,
   int x0, int y0, int x1, int y1) const
 {
-  // Bresenham 알고리즘 초기값 설정
-  int dx =  std::abs(x1 - x0);       // x축 절대 이동량
-  int dy =  std::abs(y1 - y0);       // y축 절대 이동량
-  int sx = (x0 < x1) ? 1 : -1;      // x 진행 방향 (+1 or -1)
-  int sy = (y0 < y1) ? 1 : -1;      // y 진행 방향 (+1 or -1)
-  int err = dx - dy;                 // 오차 누적 변수 (직선 편차 추적)
+  // ----------------------------------------------------------------
+  // Fat-LOS (두꺼운 시야각) 검사
+  //
+  // 기존: Bresenham 직선 위의 셀만 검사
+  //   → 직선이 모서리를 아슬아슬하게 통과해도 통과 판정
+  //   → 스트링풀링이 격벽 모서리 근처를 가로지르는 직선 경로 생성
+  //   → 로봇이 코너를 돌 때 벽 접촉 발생
+  //
+  // 수정: 직선 위 각 셀에서 safety 반경 내 주변 셀까지 모두 검사
+  //   → 직선이 장애물에서 safety 이상 떨어져 있어야만 통과 판정
+  //   → 스트링풀링이 코너 근처 직선 생성 불가 → 기존 A* 경로 유지
+  //
+  // safety = 2 셀 = 0.10m 추가 안전 마진
+  //   기존 inflation 0.45m + 0.10m = 0.55m 유효 clearance
+  //   로봇 엣지 clearance: 0.55 - 0.20(로봇반경) = 0.35m (기존 0.25m → 개선)
+  // ----------------------------------------------------------------
+  constexpr int safety = 2;
+
+  int dx =  std::abs(x1 - x0);
+  int dy =  std::abs(y1 - y0);
+  int sx = (x0 < x1) ? 1 : -1;
+  int sy = (y0 < y1) ? 1 : -1;
+  int err = dx - dy;
 
   int x = x0, y = y0;
   while (true) {
-    // 격자 범위 밖으로 나가면 LOS 차단으로 간주
-    if (x < 0 || x >= w || y < 0 || y >= h) return false;
+    // 현재 셀 중심으로 safety 반경 원형 영역 전체 검사
+    for (int ky = -safety; ky <= safety; ++ky) {
+      for (int kx = -safety; kx <= safety; ++kx) {
+        // 원형 마스크: 사각형 아닌 원 형태로 검사
+        if (kx * kx + ky * ky > safety * safety) continue;
+        int nx = x + kx;
+        int ny = y + ky;
+        // 맵 범위 밖 = 장애물로 간주
+        if (nx < 0 || nx >= w || ny < 0 || ny >= h) return false;
+        int8_t v = grid[ny * w + nx];
+        // occupied(>50) 또는 unknown(<0) → LOS 차단
+        if (v > 50 || v < 0) return false;
+      }
+    }
 
-    // 현재 셀 값 확인
-    int8_t v = grid[y * w + x];
-    // occupied(>50) 또는 unknown(<0): 시야 차단
-    if (v > 50 || v < 0) return false;
-
-    // 목표 셀 도달 → 직선 경로 전체 통과 (LOS 확보)
     if (x == x1 && y == y1) break;
 
-    // Bresenham 다음 셀 결정
-    // err 값에 따라 x 또는 y(또는 둘 다) 이동
     int e2 = 2 * err;
     if (e2 > -dy) { err -= dy; x += sx; }
     if (e2 <  dx) { err += dx; y += sy; }
   }
 
-  return true; // 장애물 없이 목표까지 도달 → LOS 확보
+  return true;
 }
 
 // ============================================================
