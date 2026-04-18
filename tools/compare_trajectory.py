@@ -334,9 +334,9 @@ def plot_trajectory(traj_name: str,
         t = [r[0] for r in lqr_data["rmse"]]
         v = [r[4] for r in lqr_data["rmse"]]
         ax_rmse.plot(t, v, label="TVLQR", color=color_lqr, lw=1.2, alpha=alpha)
-    ax_rmse.axhline(0.25, color="gray", ls="--", lw=0.8, label="안정화 기준 0.25m")
+    ax_rmse.axhline(0.25, color="gray", ls="--", lw=0.8, label="Stabilization threshold 0.25m")
     ax_rmse.set_title(f"{traj_name} — Tracking RMSE")
-    ax_rmse.set_xlabel("시간 [s]"); ax_rmse.set_ylabel("RMSE [m]")
+    ax_rmse.set_xlabel("Time [s]"); ax_rmse.set_ylabel("RMSE [m]")
     ax_rmse.legend(fontsize=7); ax_rmse.grid(True, alpha=0.3)
 
     # 2. Latency 시계열
@@ -348,9 +348,9 @@ def plot_trajectory(traj_name: str,
         t = [l[0] for l in lqr_data["lat"]]
         v = [l[1] for l in lqr_data["lat"]]
         ax_lat.plot(t, v, label="TVLQR", color=color_lqr, lw=0.8, alpha=0.6)
-    ax_lat.axhline(20.0, color="gray", ls="--", lw=0.8, label="제어주기 20ms")
-    ax_lat.set_title(f"{traj_name} — solve time Latency")
-    ax_lat.set_xlabel("시간 [s]"); ax_lat.set_ylabel("Latency [ms]")
+    ax_lat.axhline(20.0, color="gray", ls="--", lw=0.8, label="Control period 20ms")
+    ax_lat.set_title(f"{traj_name} — Solve time Latency")
+    ax_lat.set_xlabel("Time [s]"); ax_lat.set_ylabel("Latency [ms]")
     ax_lat.legend(fontsize=7); ax_lat.grid(True, alpha=0.3)
 
     # 3. 선속도 v
@@ -362,7 +362,7 @@ def plot_trajectory(traj_name: str,
         t = [c[0] for c in lqr_data["cv"]]
         v = [c[1] for c in lqr_data["cv"]]
         ax_v.plot(t, v, label="TVLQR", color=color_lqr, lw=1.0, alpha=alpha)
-    ax_v.set_title(f"{traj_name} — 선속도 v")
+    ax_v.set_title(f"{traj_name} — Linear velocity v")
     ax_v.set_xlabel("시간 [s]"); ax_v.set_ylabel("v [m/s]")
     ax_v.legend(fontsize=7); ax_v.grid(True, alpha=0.3)
 
@@ -375,7 +375,7 @@ def plot_trajectory(traj_name: str,
         t = [c[0] for c in lqr_data["cv"]]
         w = [c[2] for c in lqr_data["cv"]]
         ax_w.plot(t, w, label="TVLQR", color=color_lqr, lw=1.0, alpha=alpha)
-    ax_w.set_title(f"{traj_name} — 각속도 ω (진동)")
+    ax_w.set_title(f"{traj_name} — Angular velocity ω")
     ax_w.set_xlabel("시간 [s]"); ax_w.set_ylabel("ω [rad/s]")
     ax_w.legend(fontsize=7); ax_w.grid(True, alpha=0.3)
 
@@ -386,7 +386,7 @@ def plot_trajectory(traj_name: str,
             t  = np.array([c[0] for c in data["cv"]])[1:]
             dw = np.diff([c[2] for c in data["cv"]])
             ax_dw.plot(t, dw, label=label, color=color, lw=0.8, alpha=0.7)
-    ax_dw.set_title(f"{traj_name} — Δω (각속도 변화량)")
+    ax_dw.set_title(f"{traj_name} — Δω (angular velocity change)")
     ax_dw.set_xlabel("시간 [s]"); ax_dw.set_ylabel("Δω [rad/s]")
     ax_dw.legend(fontsize=7); ax_dw.grid(True, alpha=0.3)
 
@@ -396,9 +396,9 @@ def plot_trajectory(traj_name: str,
         if data and data.get("cv"):
             ws = np.abs([c[2] for c in data["cv"]])
             ax_clip.hist(ws, bins=30, alpha=0.5, label=label, color=color, density=True)
-    ax_clip.axvline(1.0, color="red", ls="--", lw=1.0, label="|ω|=1 한계")
-    ax_clip.set_title(f"{traj_name} — |ω| 분포 (클리핑 확인)")
-    ax_clip.set_xlabel("|ω| [rad/s]"); ax_clip.set_ylabel("밀도")
+    ax_clip.axvline(1.0, color="red", ls="--", lw=1.0, label="|ω|=1 limit")
+    ax_clip.set_title(f"{traj_name} — |ω| distribution (clipping check)")
+    ax_clip.set_xlabel("|ω| [rad/s]"); ax_clip.set_ylabel("Density")
     ax_clip.legend(fontsize=7); ax_clip.grid(True, alpha=0.3)
 
 
@@ -456,7 +456,7 @@ def main():
     # ---- 그래프 ----
     n_trajs = (1 if has_straight else 0) + (1 if has_circle else 0) + (1 if has_figure8 else 0)
     fig = plt.figure(figsize=(16, 10 * n_trajs))
-    fig.suptitle("MPC vs TVLQR — 경로별 제어기 비교", fontsize=14, fontweight="bold")
+    fig.suptitle("MPC vs TVLQR — Controller Comparison by Trajectory", fontsize=14, fontweight="bold")
 
     row_idx = 0
     gs = gridspec.GridSpec(n_trajs * 2, 3, hspace=0.6, wspace=0.4)
@@ -470,7 +470,7 @@ def main():
             fig.add_subplot(gs[row_idx * 2 + 1, 1]),
             fig.add_subplot(gs[row_idx * 2 + 1, 2]),
         ]
-        plot_trajectory("직선", straight_mpc, straight_lqr,
+        plot_trajectory("Straight", straight_mpc, straight_lqr,
                         axes[0], axes[1], axes[2], axes[3], axes[4], axes[5])
         row_idx += 1
 
@@ -483,7 +483,7 @@ def main():
             fig.add_subplot(gs[row_idx * 2 + 1, 1]),
             fig.add_subplot(gs[row_idx * 2 + 1, 2]),
         ]
-        plot_trajectory("원형", circle_mpc, circle_lqr,
+        plot_trajectory("Circle", circle_mpc, circle_lqr,
                         axes[0], axes[1], axes[2], axes[3], axes[4], axes[5])
         row_idx += 1
 
@@ -496,7 +496,7 @@ def main():
             fig.add_subplot(gs[row_idx * 2 + 1, 1]),
             fig.add_subplot(gs[row_idx * 2 + 1, 2]),
         ]
-        plot_trajectory("8자", fig8_mpc, fig8_lqr,
+        plot_trajectory("Figure-8", fig8_mpc, fig8_lqr,
                         axes[0], axes[1], axes[2], axes[3], axes[4], axes[5])
 
     plt.savefig(args.out, dpi=150, bbox_inches="tight")
