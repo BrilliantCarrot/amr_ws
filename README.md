@@ -32,7 +32,7 @@ This project implements a complete AMR (Autonomous Mobile Robot) navigation stac
      ┌──────▼──────┐ ┌─────▼──────┐ ┌─────▼──────┐
      │ slam_toolbox│ │ obstacle_  │ │  A* global │   PERCEPTION
      │ online async│ │ tracker    │ │  planner   │
-     └──────┬──────┘ └─────┬──────┘ └─────┬──────┘
+     └──────┬──────┘ └─────┬──────┘ └──────┬─────┘
             │              │               │
      ┌──────▼──────────────┐         ┌─────▼──────┐
      │   map_ekf_node      │         │localization│   ESTIMATION
@@ -44,7 +44,7 @@ This project implements a complete AMR (Autonomous Mobile Robot) navigation stac
      │  mpc_core   │ │  mpc_node  │ │ tracking_  │   CONTROL
      │ OSQP solver │◄│ 50Hz ctrl  │ │ rmse_node  │
      │ N=20 ~2ms   │ │ /cmd_vel   │ │ win=100    │
-     └─────────────┘ └──────┬─────┘ └────────────┘
+     └─────────────┘ └───────┬────┘ └────────────┘
                              │
      ┌───────────────────────▼──────────────────────┐
      │  state_machine_node · watchdog_node · mock_  │   SAFETY
@@ -52,8 +52,8 @@ This project implements a complete AMR (Autonomous Mobile Robot) navigation stac
      └───────────────────────┬──────────────────────┘
                              │
      ┌───────────────────────▼──────────────────────┐
-     │               Gazebo Fortress                 │
-     │     /cmd_vel → DiffDrive simulator            │
+     │               Gazebo Fortress                │
+     │     /cmd_vel → DiffDrive simulator           │
      └──────────────────────────────────────────────┘
 ```
 
@@ -152,6 +152,8 @@ Any ──(external command)──► MANUAL_OVERRIDE
 
 Mission scenario: A\*-planned corridor navigation → dynamic obstacle avoidance → comm failure injection → LOC_LOST injection → re-acquisition
 
+![Performance Comparison](results/mc_dashboard_all_in_one.png)
+
 | KPI | Target | Result | Status |
 |-----|--------|--------|--------|
 | Mission success rate | > 90% | **98%** (49/50) | ✅ |
@@ -163,9 +165,67 @@ Mission scenario: A\*-planned corridor navigation → dynamic obstacle avoidance
 | safe_stop detection | every trial | 49/50 | ✅ |
 | MPC solve time (avg) | < 20 ms | **~2 ms** | ✅ |
 
-> **Note on RMSE:** Tracking RMSE under fault injection (0.235 m) includes LOC_LOST and COMM_FAIL transient periods. Normal-operation RMSE is 0.017 m (W5 baseline). KPI conditions are reported separately for honest analysis.
-
 > **Trial 38 collision:** LOC_LOST re-acquisition transient — min_clearance = −0.210 m (threshold −0.200 m, 0.01 m margin). Statistically acceptable at 2% over 50 trials.
+
+> **Trial 39 RMSE spike (3.719 m):** Direct consequence of Trial 38 early termination (32.0 s vs. ~44 s nominal). The collision caused an abnormal trial exit before slam_toolbox could complete clean shutdown — the process was killed mid-state, leaving a corrupted `.posegraph`/`.data` on disk. Trial 39 initialized from this stale map, causing a multi-meter offset between SLAM-estimated pose and ground truth. `map_ekf_node` ingested the corrupted LiDAR observations, driving MPC reference error to 3.72 m. `safe_stop_count = 3` (vs. 2 in all other trials) confirms the additional instability. Full recovery completed within Trial 39 itself — Trial 40 onward returns to nominal RMSE (0.201 m), indicating the SLAM re-initialization converged during the trial.  
+> **Root cause:** `monte_carlo.py` inter-trial reset sequence (`pkill → sleep(2) → restart → sleep(5)`) assumes clean prior-trial shutdown. A collision-triggered early exit violates this assumption. Mitigation: add exit-status check before reset, or extend sleep after detected collision trials.
+
+### Controller Comparison — MPC vs TVLQR (3 Trajectories)
+
+Both MPC and TVLQR were implemented from scratch and benchmarked across three
+reference trajectories. TVLQR uses per-cycle Jacobian linearization and
+warm-started Backward Riccati iteration (riccati_iter=500, tol=1e-2);
+MPC uses OSQP with a 20-step receding horizon.
+
+| Metric | Straight | | Circle | | Figure-8 | |
+|---|---|---|---|---|---|---|
+| | MPC | TVLQR | MPC | TVLQR | MPC | TVLQR |
+| RMSE mean (m) | **0.165** | 0.172 | **0.188** | 0.198 | 0.159 | **0.135** |
+| RMSE std (m) | 0.059 | **0.004** | 0.103 | **0.057** | 0.084 | **0.052** |
+| Solve time mean (ms) | 2.09 | **0.42** | 2.27 | **2.08** | 2.26 | **1.70** |
+| Δω std — smoothness | **0.006** | 0.026 | **MPC** | — | **MPC** | — |
+| ω clipping rate (%) | **0.5** | 3.1 | lower | — | lower | — |
+
+> **Straight:** MPC achieves lower mean RMSE (0.165 m vs 0.172 m) but exhibits
+> high variance (σ=0.059 m, 13.7× LQR). The RMSE time-series shows a non-monotonic
+> rise-then-fall pattern through t=20 s before converging — a consequence of the
+> single linearization point drifting as the robot accelerates along the path.
+> TVLQR converges immediately to a flat 0.172 m band. MPC demonstrates clear
+> advantage in angular velocity smoothness (Δω std 4.4× lower) owing to the
+> N=20 horizon penalizing abrupt input changes.
+> TVLQR solve time is 5× faster (0.42 ms vs 2.09 ms) but produces latency spikes
+> up to 11.5 ms (p99=9.8 ms) during the early convergence phase — caused by
+> warm-start P_prev becoming a poor initial value when curvature changes rapidly.
+
+> **Circle:** MPC holds a marginal RMSE mean advantage (0.188 m vs 0.198 m), but
+> the Q1→Q4 breakdown reveals a non-monotonic pattern: MPC RMSE re-increases in Q4
+> (0.321→0.207→0.075→0.152 m) while TVLQR converges monotonically
+> (0.284→0.186→0.162→0.161 m). This is the single-linearization limit of MPC —
+> over a 20-step horizon, accumulated nonlinearity from continuous rotation causes
+> the prediction model to diverge from reality. TVLQR re-linearizes every 20 ms,
+> eliminating this drift.
+
+> **Figure-8:** TVLQR outperforms MPC by 15% in mean RMSE (0.135 m vs 0.159 m)
+> and 14% in max RMSE (0.325 m vs 0.377 m). The RMSE time-series makes the
+> mechanism explicit: MPC produces a periodic waveform that spikes at every
+> direction reversal, while TVLQR maintains monotonic convergence throughout.
+> As path complexity increases, the per-cycle re-linearization advantage of TVLQR
+> becomes dominant and the MPC horizon smoothness advantage diminishes
+> (Δω std ratio: 4.4× straight → 1.3× circle → 1.2× figure-8).
+
+![Straight trajectory comparison](results/compare_trajectory_straight.png)
+![Circle trajectory comparison](results/compare_trajectory_circle.png)
+![Figure-8 trajectory comparison](results/compare_trajectory_figure8.png)
+
+**Key insight:** The crossover point between MPC and TVLQR is path curvature
+complexity. On straight or mildly curved paths, MPC's constraint-aware horizon
+planning produces smoother inputs and marginally better tracking. On continuously
+or reversally curved paths, TVLQR's per-cycle re-linearization eliminates the
+nonlinearity accumulation that degrades MPC's prediction accuracy. Neither
+controller dominates universally — the correct choice depends on the operational
+profile. For a GPS-denied AMR navigating warehouse corridors (predominantly
+straight + gentle turns), MPC is the preferred primary controller. TVLQR serves
+as a computationally lighter fallback with predictable convergence behavior.
 
 ---
 
@@ -341,26 +401,26 @@ amr_ws/
 1. F. Borrelli, A. Bemporad, M. Morari, *Predictive Control for Linear and Hybrid Systems*, Cambridge University Press, 2017
 2. B. Stellato, G. Banjac, P. Goulart, A. Bemporad, S. Boyd, "OSQP: An Operator Splitting Solver for Quadratic Programs," *Mathematical Programming Computation*, vol. 12, no. 4, pp. 637–672, 2020 — [doi:10.1007/s12532-020-00179-2](https://doi.org/10.1007/s12532-020-00179-2)
 
-**TVLQR**
+**TVLQR**  
 3. R. Tedrake, *Underactuated Robotics: Algorithms for Walking, Running, Swimming, Flying, and Manipulation*, MIT CSAIL, 2023 — [underactuated.mit.edu](https://underactuated.mit.edu) (Ch. 8: Linear Quadratic Regulators / TVLQR)
 
-**A\* path planning**
+**A\* path planning**  
 4. P. E. Hart, N. J. Nilsson, B. Raphael, "A Formal Basis for the Heuristic Determination of Minimum Cost Paths," *IEEE Transactions on Systems Science and Cybernetics*, vol. 4, no. 2, pp. 100–107, 1968 — [doi:10.1109/TSSC.1968.300136](https://doi.org/10.1109/TSSC.1968.300136)
 
-**EKF**
+**EKF**  
 5. S. Thrun, W. Burgard, D. Fox, *Probabilistic Robotics*, MIT Press, 2005 (Ch. 3: Gaussian Filters / EKF)
 
-**SLAM toolbox**
+**SLAM toolbox**  
 6. S. Macenski, I. Jambrecic, "SLAM Toolbox: SLAM for the Dynamic World," *Journal of Open Source Software*, vol. 6, no. 61, p. 2783, 2021
 7. S. Macenski, F. Martín, R. White, J. Ginés Clavero, "The Marathon 2: A Navigation System," *IEEE/RSJ IROS*, 2020 — [arXiv:2003.00368](https://arxiv.org/abs/2003.00368)
 
-**Euclidean clustering / LiDAR obstacle detection**
+**Euclidean clustering / LiDAR obstacle detection**  
 8. R. B. Rusu, S. Cousins, "3D is Here: Point Cloud Library (PCL)," *IEEE ICRA*, 2011
 
-**Conservative safety design / CBF (future work reference)**
+**Conservative safety design / CBF (future work reference)**  
 9. A. D. Ames, S. Coogan, M. Egerstedt, G. Notomista, K. Sreenath, P. Tabuada, "Control Barrier Functions: Theory and Applications," *18th European Control Conference (ECC)*, pp. 3420–3431, 2019
 
-**MPC for mobile robot navigation**
+**MPC for mobile robot navigation**  
 10. H. Oleynikova, M. Burri, Z. Taylor, J. Nieto, R. Siegwart, E. Galceran, "Continuous-Time Trajectory Optimization for Online UAV Replanning," *IEEE/RSJ IROS*, 2016
 
 ---

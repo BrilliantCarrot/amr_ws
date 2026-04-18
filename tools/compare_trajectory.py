@@ -1,9 +1,11 @@
 """
 MPC vs TVLQR 경로별 제어기 비교 분석 스크립트
-원형(circle) + 8자(figure8) 동시 비교
+직선(straight) + 원형(circle) + 8자(figure8) 동시 비교 가능하도록 구성
 
 [사용법]
   python3 compare_trajectory.py \
+    --mpc_straight ~/amr_ws/bags/mpc_run \
+    --lqr_straight ~/amr_ws/bags/lqr_run \
     --mpc_circle  ~/amr_ws/bags/mpc_circle  \
     --lqr_circle  ~/amr_ws/bags/lqr_circle  \
     --mpc_figure8 ~/amr_ws/bags/mpc_figure8 \
@@ -13,6 +15,15 @@ MPC vs TVLQR 경로별 제어기 비교 분석 스크립트
   python3 compare_trajectory.py \
     --mpc_circle ~/amr_ws/bags/mpc_circle \
     --lqr_circle ~/amr_ws/bags/lqr_circle
+
+# 3경로 동시
+  python3 compare_trajectory.py \
+    --mpc_straight ~/amr_ws/bags/mpc_run \
+    --lqr_straight ~/amr_ws/bags/lqr_run \
+    --mpc_circle   ~/amr_ws/bags/mpc_circle \
+    --lqr_circle   ~/amr_ws/bags/lqr_circle \
+    --mpc_figure8  ~/amr_ws/bags/mpc_figure8 \
+    --lqr_figure8  ~/amr_ws/bags/lqr_figure8
 
 [분석 지표]
   1. Tracking RMSE        : 경로 추종 오차 (mean / max / std)
@@ -398,6 +409,8 @@ def plot_trajectory(traj_name: str,
 def main():
     parser = argparse.ArgumentParser(
         description="MPC vs TVLQR 경로별 비교 분석")
+    parser.add_argument("--mpc_straight", default=None, help="MPC 직선 bag 경로")
+    parser.add_argument("--lqr_straight", default=None, help="LQR 직선 bag 경로")
     parser.add_argument("--mpc_circle",  default=None, help="MPC 원형 bag 경로")
     parser.add_argument("--lqr_circle",  default=None, help="LQR 원형 bag 경로")
     parser.add_argument("--mpc_figure8", default=None, help="MPC 8자 bag 경로")
@@ -407,39 +420,59 @@ def main():
     args = parser.parse_args()
 
     # 입력 확인
+    has_straight = args.mpc_straight or args.lqr_straight
     has_circle  = args.mpc_circle or args.lqr_circle
     has_figure8 = args.mpc_figure8 or args.lqr_figure8
-    if not has_circle and not has_figure8:
+    if not has_straight and not has_circle and not has_figure8:
         print("오류: bag 경로를 하나 이상 지정하세요.")
         parser.print_help()
         return
 
     # ---- 데이터 로드 ----
     print("\n[데이터 로드 중...]")
+    straight_mpc = load_bag(args.mpc_straight) if args.mpc_straight else None
+    straight_lqr = load_bag(args.lqr_straight) if args.lqr_straight else None
     circle_mpc  = load_bag(args.mpc_circle)  if args.mpc_circle  else None
     circle_lqr  = load_bag(args.lqr_circle)  if args.lqr_circle  else None
     fig8_mpc    = load_bag(args.mpc_figure8) if args.mpc_figure8 else None
     fig8_lqr    = load_bag(args.lqr_figure8) if args.lqr_figure8 else None
 
     # ---- 통계 계산 ----
+    straight_mpc_s = calc_stats(straight_mpc, "MPC 직선")
+    straight_lqr_s = calc_stats(straight_lqr, "LQR 직선")
     circle_mpc_s  = calc_stats(circle_mpc,  "MPC 원형")
     circle_lqr_s  = calc_stats(circle_lqr,  "LQR 원형")
     fig8_mpc_s    = calc_stats(fig8_mpc,    "MPC 8자")
     fig8_lqr_s    = calc_stats(fig8_lqr,    "LQR 8자")
 
     # ---- 터미널 출력 ----
+    if has_straight:
+        print_table("직선 (Straight)", straight_mpc_s, straight_lqr_s)    
     if has_circle:
         print_table("원형 (Circle)", circle_mpc_s, circle_lqr_s)
     if has_figure8:
         print_table("8자 (Figure-8)", fig8_mpc_s, fig8_lqr_s)
 
     # ---- 그래프 ----
-    n_trajs = (1 if has_circle else 0) + (1 if has_figure8 else 0)
+    n_trajs = (1 if has_straight else 0) + (1 if has_circle else 0) + (1 if has_figure8 else 0)
     fig = plt.figure(figsize=(16, 10 * n_trajs))
     fig.suptitle("MPC vs TVLQR — 경로별 제어기 비교", fontsize=14, fontweight="bold")
 
     row_idx = 0
     gs = gridspec.GridSpec(n_trajs * 2, 3, hspace=0.6, wspace=0.4)
+
+    if has_straight:
+        axes = [
+            fig.add_subplot(gs[row_idx * 2,     0]),
+            fig.add_subplot(gs[row_idx * 2,     1]),
+            fig.add_subplot(gs[row_idx * 2,     2]),
+            fig.add_subplot(gs[row_idx * 2 + 1, 0]),
+            fig.add_subplot(gs[row_idx * 2 + 1, 1]),
+            fig.add_subplot(gs[row_idx * 2 + 1, 2]),
+        ]
+        plot_trajectory("직선", straight_mpc, straight_lqr,
+                        axes[0], axes[1], axes[2], axes[3], axes[4], axes[5])
+        row_idx += 1
 
     if has_circle:
         axes = [
