@@ -17,6 +17,8 @@ This project implements a complete AMR (Autonomous Mobile Robot) navigation stac
 - **Fail-safe State Machine** with Watchdog — NORMAL → DEGRADED → SAFE_STOP under localization loss and comm failure
 - **Monte Carlo validation** — 98% mission success rate over 50 runs with injected LOC_LOST + COMM_FAIL faults
 
+![overview](results/scene_view.png)
+
 ---
 
 ## System Architecture
