@@ -203,7 +203,7 @@ def launch_setup(context, *args, **kwargs):
                 f'--ros-args '
                 f'-p goal_x:={goal_x_val} '
                 f'-p goal_y:={goal_y_val} '
-                f'-p robot_radius:=0.55 '
+                f'-p robot_radius:=0.45 '
                 f'-p replan_period_sec:=2.0 '
                 f'-p replan_obs_dist:=0.5 '
                 f'-p wp_spacing:=0.05 '

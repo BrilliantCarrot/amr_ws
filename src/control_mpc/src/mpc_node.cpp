@@ -36,8 +36,8 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("v_ref_", 0.1); // 로봇 이동 선속도
 
   // 장애물 관련 파라미터 (없다면 추가 선언)
-  this->declare_parameter("obs_weight", 30.0);    // 기존 200.0 -> 50.0으로 수정
-  this->declare_parameter("obs_safe_dist", 0.4);  // 기존 0.6 -> 0.4로 수정
+  this->declare_parameter("obs_weight", 30.0);    // 기존 200.0에서
+  this->declare_parameter("obs_safe_dist", 0.2);  // 기존 0.6->0.4
 
   // 경로 관련 파라미터
   this->declare_parameter("trajectory_type", std::string("straight"));
@@ -50,6 +50,25 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   // false: 기존 hardcoded 경로(trajectory_type) 사용 (하위호환)
   this->declare_parameter("use_global_planner", false);
 
+  // 도킹 관련 파라미터 선언
+  // dock_yaw: 도킹 목표 헤딩 [rad] — 예) 1.5708 = 90° (좌측 도킹)
+  this->declare_parameter("dock_yaw",         0.0);
+  // dock_pos_tol: 위치 완료 판정 임계값 [m]
+  this->declare_parameter("dock_pos_tol",     0.05);
+  // dock_yaw_tol_deg: 헤딩 완료 판정 임계값 [deg], 내부에서 rad로 변환
+  this->declare_parameter("dock_yaw_tol_deg", 3.0);
+
+  // CBF Safety Filter 파라미터 선언
+  // cbf_gamma   : class-K 계수 (α(h) = γ*h) — 추천 1.0~3.0
+  // cbf_slack_p : soft CBF 페널티 — 추천 500.0
+  // cbf_d_safe  : 추가 안전 마진 [m] — 0이면 obs.radius만 사용
+  // cbf_enabled : false로 하면 CBF 건너뜀 (비교 실험용)
+  this->declare_parameter("cbf_gamma",   2.0);
+  this->declare_parameter("cbf_slack_p", 1000.0);
+  this->declare_parameter("cbf_d_safe",  0.20);
+  this->declare_parameter("cbf_lookahead", 0.25);
+  this->declare_parameter("cbf_enabled", true);
+
   // 파라미터 로드
   mpc_params_       = loadMpcParams();
   trajectory_type_  = this->get_parameter("trajectory_type").as_string();
@@ -58,6 +77,44 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   slip_ratio_       = this->get_parameter("slip_ratio").as_double();
   artificial_load_ms_ = this->get_parameter("artificial_load_ms").as_double();
   use_global_planner_ = this->get_parameter("use_global_planner").as_bool();
+
+  // 도킹 파라미터 로드
+  dock_yaw_     = this->get_parameter("dock_yaw").as_double();
+  dock_pos_tol_ = this->get_parameter("dock_pos_tol").as_double();
+  dock_yaw_tol_ = this->get_parameter("dock_yaw_tol_deg").as_double()
+                  * M_PI / 180.0;  // deg → rad 변환
+
+  // CBF 파라미터 로드 및 필터 초기화
+  cbf_gamma_   = this->get_parameter("cbf_gamma").as_double();
+  cbf_slack_p_ = this->get_parameter("cbf_slack_p").as_double();
+  cbf_d_safe_  = this->get_parameter("cbf_d_safe").as_double();
+  cbf_enabled_ = this->get_parameter("cbf_enabled").as_bool();
+  double cbf_lookahead = this->get_parameter("cbf_lookahead").as_double();
+
+  CbfFilter::Params cbf_params;
+  cbf_params.gamma   = cbf_gamma_;
+  cbf_params.slack_p = cbf_slack_p_;
+  cbf_params.d_safe  = cbf_d_safe_;
+  cbf_params.v_max   = mpc_params_.v_max;
+  cbf_params.v_min   = mpc_params_.v_min;
+  cbf_params.w_max   = mpc_params_.w_max;
+  cbf_params.w_min   = mpc_params_.w_min;
+  cbf_params.lookahead = cbf_lookahead;
+  cbf_params.react_dist = 0.35;
+  cbf_params.rear_margin = 0.05;
+  cbf_params.max_active_obstacles = 1;
+  cbf_filter_ = std::make_unique<CbfFilter>(cbf_params);
+
+
+
+  RCLCPP_INFO(this->get_logger(),
+      "[CBF] 초기화 완료 | gamma=%.2f slack_p=%.1f d_safe=%.3fm L=%.3fm enabled=%s",
+    cbf_gamma_, cbf_slack_p_, cbf_d_safe_, cbf_lookahead, cbf_enabled_ ? "true" : "false");
+
+  RCLCPP_INFO(this->get_logger(),
+    "[Docking] 파라미터 로드 완료 | dock_yaw=%.2f° pos_tol=%.3fm yaw_tol=%.2f°",
+    dock_yaw_ * 180.0 / M_PI, dock_pos_tol_,
+    dock_yaw_tol_ * 180.0 / M_PI);
 
   // 런타임 파라미터 변경 콜백
   // ros2 param set으로 변경 시 즉시 멤버변수에 반영
@@ -68,7 +125,7 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
       for (const auto & p : params) {
         if (p.get_name() == "artificial_load_ms")
           artificial_load_ms_ = p.as_double();
-        else if (p.get_name() == "drop_rate")
+        else if (p.get_name() == "slip_ratio")
           slip_ratio_ = p.as_double();
       }
       rcl_interfaces::msg::SetParametersResult result;
@@ -505,7 +562,26 @@ void MpcNode::controlCallback()
     publishStop();
     return;
   }
-  if (local_mission_done) {
+  // ── NAVIGATING → DOCKING 전환 ──────────────────────────────
+  // A* 경로의 마지막 waypoint 도달(mission_done_) 시 정지 대신 DOCKING 진입
+  // dock_x_, dock_y_를 마지막 waypoint 위치(= path_planner의 goal)로 확정
+  if (mission_phase_ == MissionPhase::NAVIGATING && local_mission_done) {
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (!waypoints_.empty()) {
+        dock_x_ = waypoints_.back()(0);
+        dock_y_ = waypoints_.back()(1);
+      }
+    }
+    mission_phase_ = MissionPhase::DOCKING;
+    RCLCPP_INFO(this->get_logger(),
+      "[Docking] NAVIGATING → DOCKING | "
+      "dock_pos=(%.3f, %.3f) dock_yaw=%.2f°",
+      dock_x_, dock_y_, dock_yaw_ * 180.0 / M_PI);
+  }
+
+  // DOCKED: 완료 상태 유지 (정지 명령 반복 발행)
+  if (mission_phase_ == MissionPhase::DOCKED) {
     publishStop();
     return;
   }
@@ -532,6 +608,8 @@ void MpcNode::controlCallback()
   }
 
   // --- 1. reference trajectory 생성 ---
+  // DOCKING 단계는 이 아래 블록에서 P제어로 처리 후 return하므로
+  // generateReference()는 NAVIGATING일 때만 실행됨
   std::vector<StateVec> x_ref = generateReference(x_pred);
 
   {
@@ -605,24 +683,310 @@ void MpcNode::controlCallback()
   }
 
   v_cmd = std::clamp(v_cmd, mpc_params_.v_min, mpc_params_.v_max);
+  
+    if (!use_global_planner_) {
+    v_cmd = std::max(v_cmd, 0.07);
+  }
 
-  // 로컬 변수(local_obstacles, local_x0)를 사용하여 거리 연산을 수행합니다.
   if (!local_obstacles.empty()) {
     double min_dist = 1e9;
     for (const auto & obs : local_obstacles) {
-      double d = std::hypot(local_x0(0)-obs.x, local_x0(1)-obs.y) - obs.radius;
+      double d = std::hypot(local_x0(0) - obs.x, local_x0(1) - obs.y) - obs.radius;
       min_dist = std::min(min_dist, d);
     }
-    constexpr double slow_start = 0.5;  
+
+    constexpr double slow_start = 0.7;
     if (min_dist < slow_start && v_cmd > 0.0) {
-      v_cmd = std::max(v_cmd, 0.2);
+      const double scale = std::clamp(min_dist / slow_start, 0.0, 1.0);
+      v_cmd *= scale;
+
+      // 장애물 매우 근접 시 전진 하한 제거함
+      if (min_dist > 0.25) {
+        v_cmd = std::max(v_cmd, 0.03);
+      }
     }
+  }
+
+  // ── DOCKING 단계: MPC 우회 → P제어기로 직접 제어 ─────────────────
+  //
+  // [왜 MPC를 우회하는가?]
+  //   MPC 비용함수에는 r_dv=30, r_dw=20 (입력 변화 페널티)이 설정돼 있음.
+  //   v_ref=0 reference에서 0.1m 오차는 MPC가 "가만히 있는 게 최적"으로
+  //   판단할 만큼 작은 값이라 사실상 zero 명령만 생성함.
+  //   → 도킹처럼 오차가 수 cm인 정밀 구간에서는 단순 P제어가 더 효과적.
+  //
+  // [P제어 도킹 로직 — 2단계]
+  //   Step 1 (위치 오차 > dock_pos_tol_):
+  //     dock 목표 방향으로 회전하면서 전진 (pos 수렴)
+  //     v = Kp_v * pos_err   (거리 비례 속도)
+  //     ω = Kp_w * heading_err (dock 방향으로 헤딩 보정)
+  //
+  //   Step 2 (위치 수렴 후):
+  //     dock_yaw_ 맞추기 (최종 헤딩 정렬)
+  //     v = 0
+  //     ω = Kp_w * yaw_err_to_dock_yaw
+  // ──────────────────────────────────────────────────────────────────
+  if (mission_phase_ == MissionPhase::DOCKING) {
+
+    // 현재 위치 → dock 목표까지 벡터
+    double dx_to_dock  = dock_x_ - local_x0(0);
+    double dy_to_dock  = dock_y_ - local_x0(1);
+    double pos_err     = std::hypot(dx_to_dock, dy_to_dock);
+
+    // dock 방향 헤딩 오차: 현재 yaw와 "dock 목표 방향" 사이 최단 각도
+    double angle_to_dock  = std::atan2(dy_to_dock, dx_to_dock);
+    double heading_err    = std::atan2(
+      std::sin(angle_to_dock - local_x0(2)),
+      std::cos(angle_to_dock - local_x0(2)));
+
+    // dock_yaw_ 최종 정렬 오차
+    double raw_diff  = local_x0(2) - dock_yaw_;
+    double yaw_err   = std::atan2(std::sin(raw_diff), std::cos(raw_diff));
+
+    // P제어 게인 (tunable)
+    // Kp_v: 거리 1m당 0.3m/s — DOCK_V_MAX(0.05)로 클램핑되므로 과도 응답 없음
+    // Kp_w: 각도 1rad당 0.8rad/s — w_max(1.0)로 클램핑됨
+    constexpr double Kp_v      = 0.3;
+    constexpr double Kp_w      = 0.8;
+    constexpr double DOCK_V_MAX = 0.05;  // 최대 도킹 속도 [m/s]
+
+    double v_dock = 0.0;
+    double w_dock = 0.0;
+
+    if (pos_err > dock_pos_tol_) {
+      // Step 1: dock 방향으로 이동하면서 헤딩 보정
+      v_dock = std::clamp(Kp_v * pos_err, -DOCK_V_MAX, DOCK_V_MAX);
+      w_dock = std::clamp(Kp_w * heading_err,
+                          mpc_params_.w_min, mpc_params_.w_max);
+    } else {
+      // Step 2: 위치 도달 후 최종 헤딩 정렬
+      v_dock = 0.0;
+      w_dock = std::clamp(-Kp_w * yaw_err,
+                          mpc_params_.w_min, mpc_params_.w_max);
+    }
+
+    // 도킹 완료 판정: 위치 AND 헤딩 동시 만족
+    if (pos_err < dock_pos_tol_ && std::abs(yaw_err) < dock_yaw_tol_) {
+      mission_phase_ = MissionPhase::DOCKED;
+      RCLCPP_INFO(this->get_logger(),
+        "[Docking] ✅ 도킹 완료! pos_err=%.3fm  yaw_err=%.2f°",
+        pos_err, yaw_err * 180.0 / M_PI);
+      publishStop();
+      return;
+    }
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
+      "[Docking] pos_err=%.3fm  yaw_err=%.2f°  heading_err=%.2f°  "
+      "v=%.3f  w=%.3f  step=%s",
+      pos_err, yaw_err * 180.0 / M_PI, heading_err * 180.0 / M_PI,
+      v_dock, w_dock,
+      (pos_err > dock_pos_tol_) ? "1(위치수렴)" : "2(헤딩정렬)");
+
+    publishCmdVel(v_dock, w_dock);
+    return;  // MPC 이후 로직 전부 건너뜀
   }
 
   w_cmd = std::clamp(w_cmd, mpc_params_.w_min, mpc_params_.w_max);
 
+  // reactive yaw bias 추가함
+  // 부호 튐 방지하려고 hold + smoothing 넣음
+  if (false && !use_global_planner_ && !local_obstacles.empty()) {
+    double best_forward = 1e9;
+    double best_lateral = 0.0;
+    double best_clear = 1e9;
+    bool found_front_obs = false;
+
+    for (const auto & obs : local_obstacles) {
+      const double dx = obs.x - local_x0(0);
+      const double dy = obs.y - local_x0(1);
+
+      // body frame 변환함
+      const double forward =
+        std::cos(local_x0(2)) * dx + std::sin(local_x0(2)) * dy;
+      const double lateral =
+        -std::sin(local_x0(2)) * dx + std::cos(local_x0(2)) * dy;
+
+      const double clear = std::hypot(dx, dy) - obs.radius;
+
+      // 너무 넓게 보면 대표 장애물이 자주 바뀌어서 부호가 튐
+      if (forward > 0.0 && forward < 0.55 && std::abs(lateral) < 0.32) {
+        if (clear < best_clear) {
+          best_forward = forward;
+          best_lateral = lateral;
+          best_clear = clear;
+          found_front_obs = true;
+        }
+      }
+    }
+
+    // 상태 유지용 static
+    static double bias_state = 0.0;
+    static int turn_dir_hold = 0;
+    static bool bias_active = false;
+
+    const double trigger_clear = 0.12;
+    const double release_clear = 0.21;
+    const double lateral_deadband = 0.06;
+
+    double gain = 0.0;
+    double target_bias = 0.0;
+
+    if (found_front_obs && best_clear < release_clear) {
+      gain = (release_clear - best_clear) / (release_clear - trigger_clear);
+      gain = std::clamp(gain, 0.0, 1.0);
+
+      // lateral이 0 근처면 방향 바꾸지 않고 이전 방향 유지함
+      if (!bias_active) {
+        if (best_lateral > lateral_deadband) turn_dir_hold = -1;      // 장애물 좌측 → 우회전
+        else if (best_lateral < -lateral_deadband) turn_dir_hold = 1; // 장애물 우측 → 좌회전
+      } else {
+        if (best_lateral > lateral_deadband && turn_dir_hold == 0) turn_dir_hold = -1;
+        else if (best_lateral < -lateral_deadband && turn_dir_hold == 0) turn_dir_hold = 1;
+      }
+
+      if (turn_dir_hold == 0) {
+        turn_dir_hold = (best_lateral >= 0.0) ? -1 : 1;
+      }
+
+      bias_active = true;
+
+      // 0.5는 너무 큼, 먼저 0.28~0.32 범위로 제한함
+      const double w_bias_max = 0.30;
+      target_bias = static_cast<double>(turn_dir_hold) * w_bias_max * gain;
+    } else {
+      // 장애물 벗어나면 바로 0으로 끊지 말고 서서히 복귀시킴
+      bias_active = false;
+      turn_dir_hold = 0;
+      target_bias = 0.0;
+    }
+
+    // bias를 저역통과 필터처럼 부드럽게 만듦
+    const double alpha_rise = 0.18;
+    const double alpha_fall = 0.10;
+    const double alpha =
+      (std::abs(target_bias) > std::abs(bias_state)) ? alpha_rise : alpha_fall;
+
+    bias_state = (1.0 - alpha) * bias_state + alpha * target_bias;
+
+    w_cmd += bias_state;
+    w_cmd = std::clamp(w_cmd, mpc_params_.w_min, mpc_params_.w_max);
+
+    // 속도는 지금 정도면 괜찮으니 과감속만 조금 완화함
+    if (v_cmd > 0.0) {
+      double v_scale = 1.0 - 0.12 * gain;
+      v_cmd *= v_scale;
+      v_cmd = std::max(v_cmd, 0.08);
+    }
+  }
+
+  // ── CBF Safety Filter 적용 ────────────────────────────────
+  // MPC nominal 입력을 CBF-QP에 통과시켜 최종 안전 입력으로 바꿈
+  double v_pub = v_cmd;
+  double w_pub = w_cmd;
+
+  if (cbf_enabled_ && cbf_filter_ && !local_obstacles.empty()) {
+    std::vector<CbfObstacle> cbf_obstacles;
+    cbf_obstacles.reserve(local_obstacles.size());
+
+    for (const auto & obs : local_obstacles) {
+      CbfObstacle cbf_obs;
+      cbf_obs.x = obs.x;
+      cbf_obs.y = obs.y;
+      cbf_obs.radius = obs.radius;  // obsCallback에서 이미 로봇 반경 포함됨
+      cbf_obstacles.push_back(cbf_obs);
+    }
+
+    double v_safe = v_cmd;
+    double w_safe = w_cmd;
+
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(),
+      *this->get_clock(),
+      500,
+      "[CBF call] obs=%zu u_nom=(%.3f, %.3f) pose=(%.3f, %.3f, %.3f)",
+      cbf_obstacles.size(),
+      v_cmd,
+      w_cmd,
+      local_x0(0),
+      local_x0(1),
+      local_x0(2)
+    );
+
+    const bool cbf_ok = cbf_filter_->filter(
+      local_x0(0),
+      local_x0(1),
+      local_x0(2),
+      v_cmd,
+      w_cmd,
+      cbf_obstacles,
+      v_safe,
+      w_safe
+    );
+
+    if (cbf_ok) {
+      v_pub = std::clamp(v_safe, mpc_params_.v_min, mpc_params_.v_max);
+      w_pub = std::clamp(w_safe, mpc_params_.w_min, mpc_params_.w_max);
+    } else {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(),
+        *this->get_clock(),
+        500,
+        "[CBF] filter 실패. nominal 명령 사용함"
+      );
+    }
+
+    RCLCPP_WARN_THROTTLE(
+      this->get_logger(),
+      *this->get_clock(),
+      500,
+      "[CBF result] ok=%s u_nom=(%.3f, %.3f) u_safe=(%.3f, %.3f)",
+      cbf_ok ? "true" : "false",
+      v_cmd,
+      w_cmd,
+      v_pub,
+      w_pub
+    );
+  }
+
+
+
+
+// CBF 출력 튐 완화용 rate limiter임
+static bool cmd_filter_initialized = false;
+static double prev_v_pub = 0.0;
+static double prev_w_pub = 0.0;
+
+auto rateLimit = [](double target, double prev, double max_step) {
+  return prev + std::clamp(target - prev, -max_step, max_step);
+};
+
+if (!cmd_filter_initialized) {
+  prev_v_pub = v_pub;
+  prev_w_pub = w_pub;
+  cmd_filter_initialized = true;
+} else {
+  // 감속은 빠르게 허용하고, 가속은 천천히 허용함
+  const double dv_up_step = 0.010;
+  const double dv_down_step = 0.040;
+  const double dv_step = (v_pub < prev_v_pub) ? dv_down_step : dv_up_step;
+
+  // 각속도는 한 주기당 변화량 제한함
+  const double dw_step = 0.080;
+
+  v_pub = rateLimit(v_pub, prev_v_pub, dv_step);
+  w_pub = rateLimit(w_pub, prev_w_pub, dw_step);
+
+  prev_v_pub = v_pub;
+  prev_w_pub = w_pub;
+}
+
+
+
+
+
+
   // 내부에서 delay_queue_ 조작 시 락이 걸리도록 이미 수정된 함수입니다.
-  publishCmdVel(v_cmd, w_cmd);
+  publishCmdVel(v_pub, w_pub);
 
   // ----------------------------------------------------------------
   // [수정 위치 6] 상태 저장 및 통계 갱신 락 추가
@@ -653,8 +1017,10 @@ void MpcNode::controlCallback()
     }
 
     // 이전 입력 갱신 (다음 스텝의 계산을 위해 저장)
-    u_prev_(0) = v_cmd;
-    u_prev_(1) = w_cmd;
+    // u_prev_(0) = v_cmd;
+    // u_prev_(1) = w_cmd;
+    u_prev_(0) = v_pub;
+    u_prev_(1) = w_pub;
   }
 
   // --- 5. latency 통계 산출 및 발행 ---
@@ -699,8 +1065,10 @@ void MpcNode::controlCallback()
   }
 
   RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 500,
-    "[MPC] solve=%.2fms avg=%.2fms | e2e=%.2fms avg_e2e=%.2fms p99_e2e=%.2fms | v=%.3f w=%.3f",
-    elapsed_ms, avg_ms, e2e_ms, avg_e2e, p99_e2e, v_cmd, w_cmd);
+    "[MPC] solve=%.2fms avg=%.2fms | e2e=%.2fms avg_e2e=%.2fms p99_e2e=%.2fms | "
+    "u_nom=(%.3f, %.3f) u_pub=(%.3f, %.3f)",
+    elapsed_ms, avg_ms, e2e_ms, avg_e2e, p99_e2e,
+    v_cmd, w_cmd, v_pub, w_pub);
 }
 
 // ============================================================
@@ -855,7 +1223,7 @@ int MpcNode::findClosestWaypoint(const StateVec & x0)
     // double dy = x0(1) - waypoints_.back()(1);
     // if (std::sqrt(dx * dx + dy * dy) < goal_tolerance_) {
       mission_done_ = true;
-      RCLCPP_INFO(this->get_logger(), "미션 완료! 목표 지점 도달 (현재 idx: %d / 총 %d)", best_idx, n-1);
+      // RCLCPP_INFO(this->get_logger(), "미션 완료! 목표 지점 도달 (현재 idx: %d / 총 %d)", best_idx, n-1);
     // }
   }
 
@@ -935,6 +1303,54 @@ std::vector<StateVec> MpcNode::generateReference(const StateVec & x0)
       std::sin(raw_yaw - ref_yaw_base),
       std::cos(raw_yaw - ref_yaw_base));
     x_ref[k](2) = ref_yaw_base + diff;
+  }
+
+  return x_ref;
+}
+
+// ============================================================
+// generateDockingReference() — 도킹 전용 reference 생성
+//
+// [역할]
+//   DOCKING 단계에서 MPC가 dock 포즈(dock_x_, dock_y_, dock_yaw_)로
+//   정밀하게 수렴하도록 N+1개의 동일한 reference를 생성함.
+//
+// [generateReference()와의 차이]
+//   - waypoint 리스트를 따라가지 않고 dock 포즈 1점만 반복
+//   - v_ref = 0, ω_ref = 0: "정지 상태"를 목표로 설정
+//     → MPC가 dock 포즈에 수렴하면서 자연스럽게 감속
+//   - 헤딩은 continuous_theta_ 공간에서 최단 방향으로 보정
+//     → ±π 경계에서 값이 튀는 현상 방지
+//
+// [속도 제한]
+//   v_cmd는 controlCallback에서 DOCK_V_MAX(0.05m/s)로 클램핑됨.
+//   이 함수 자체는 참조값만 생성하고 속도 제한은 하지 않음.
+// ============================================================
+std::vector<StateVec> MpcNode::generateDockingReference(const StateVec & x0)
+{
+  std::vector<StateVec> x_ref(mpc_params_.N + 1);
+
+  // 도킹 목표 헤딩을 현재 continuous_theta_ 공간으로 변환
+  // raw_diff: dock_yaw_와 현재 yaw의 최단 각도 차이 ([-π, π])
+  // dock_yaw_cont: continuous 공간에서의 dock_yaw 표현
+  //   → x0(2)가 2π를 넘어가도 MPC 내부에서 yaw 오차가 튀지 않음
+  double raw_diff      = std::atan2(
+    std::sin(dock_yaw_ - x0(2)),
+    std::cos(dock_yaw_ - x0(2)));
+  double dock_yaw_cont = x0(2) + raw_diff;
+
+  // dock 목표 상태 벡터 구성
+  StateVec dock_state;
+  dock_state(0) = dock_x_;        // 목표 x [m]
+  dock_state(1) = dock_y_;        // 목표 y [m]
+  dock_state(2) = dock_yaw_cont;  // 목표 헤딩 [rad, continuous]
+  dock_state(3) = 0.0;            // v_ref = 0 (정지 목표)
+  dock_state(4) = 0.0;            // ω_ref = 0
+
+  // N+1개 전부 동일한 dock_state로 채움
+  // MPC는 이 고정 목표를 향해 최적 입력(v, ω)을 계산
+  for (int k = 0; k <= mpc_params_.N; ++k) {
+    x_ref[k] = dock_state;
   }
 
   return x_ref;

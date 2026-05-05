@@ -27,7 +27,7 @@ This project implements a complete AMR (Autonomous Mobile Robot) navigation stac
 
 ```
 ┌──────────────────────────────────────────────────────┐
-│                   Sensor Inputs                       │
+│                   Sensor Inputs                      │
 │     LiDAR /scan · IMU /imu · Wheel odom /odom        │
 └───────────┬──────────────┬───────────────┬───────────┘
             │              │               │
@@ -390,9 +390,8 @@ amr_ws/
 
 ## Future Work
 
-- **Docking & alignment:** precision docking controller using fiducial marker (AprilTag) or LiDAR-based pose estimation for charging station / handoff point alignment
 - **CBF (Control Barrier Function) integration:** mathematically guaranteed obstacle avoidance via CBF-QP safety filter layered on top of MPC — replaces heuristic bubble strategy with formal forward-invariance guarantees
-- **YOLO-based object recognition (VIO):** real-time semantic perception using YOLOv8; detected object classes feed into dynamic obstacle classification and mission-aware path re-planning
+- **YOLO-based object recognition:** real-time semantic perception using YOLOv8; detected object classes feed into dynamic obstacle classification and mission-aware path re-planning
 - **AMR + robot arm co-mission:** manipulation-integrated navigation — AMR navigates to target pose, then 6-DOF arm executes pick/place; requires coordinated task planning and collision-aware joint trajectory generation
 
 ---
@@ -400,8 +399,8 @@ amr_ws/
 ## References
 
 **MPC**
-1. F. Borrelli, A. Bemporad, M. Morari, *Predictive Control for Linear and Hybrid Systems*, Cambridge University Press, 2017
-2. B. Stellato, G. Banjac, P. Goulart, A. Bemporad, S. Boyd, "OSQP: An Operator Splitting Solver for Quadratic Programs," *Mathematical Programming Computation*, vol. 12, no. 4, pp. 637–672, 2020 — [doi:10.1007/s12532-020-00179-2](https://doi.org/10.1007/s12532-020-00179-2)
+1. F. Borrelli, A. Bemporad, M. Morari, *Predictive Control for Linear and Hybrid Systems*, Cambridge University Press, 2017  
+2. B. Stellato, G. Banjac, P. Goulart, A. Bemporad, S. Boyd, "OSQP: An Operator Splitting Solver for Quadratic Programs," *Mathematical Programming Computation*, vol. 12, no. 4, pp. 637–672, 2020 — [doi:10.1007/s12532-020-00179-2](https://doi.org/10.1007/s12532-020-00179-2)  
 
 **TVLQR**  
 3. R. Tedrake, *Underactuated Robotics: Algorithms for Walking, Running, Swimming, Flying, and Manipulation*, MIT CSAIL, 2023 — [underactuated.mit.edu](https://underactuated.mit.edu) (Ch. 8: Linear Quadratic Regulators / TVLQR)
@@ -413,7 +412,7 @@ amr_ws/
 5. S. Thrun, W. Burgard, D. Fox, *Probabilistic Robotics*, MIT Press, 2005 (Ch. 3: Gaussian Filters / EKF)
 
 **SLAM toolbox**  
-6. S. Macenski, I. Jambrecic, "SLAM Toolbox: SLAM for the Dynamic World," *Journal of Open Source Software*, vol. 6, no. 61, p. 2783, 2021
+6. S. Macenski, I. Jambrecic, "SLAM Toolbox: SLAM for the Dynamic World," *Journal of Open Source Software*, vol. 6, no. 61, p. 2783, 2021  
 7. S. Macenski, F. Martín, R. White, J. Ginés Clavero, "The Marathon 2: A Navigation System," *IEEE/RSJ IROS*, 2020 — [arXiv:2003.00368](https://arxiv.org/abs/2003.00368)
 
 **Euclidean clustering / LiDAR obstacle detection**  

@@ -3,8 +3,8 @@
 //
 // [전체 처리 흐름]
 //   /scan (LiDAR 원시 데이터, laser_link 좌표계)
-//     ↓ TF2 변환 (laser_link → map frame)
-//   map frame 기준 2D 포인트 배열
+//     ↓ range 기반 필터링 (LiDAR frame, 맵 크기 무관)
+//   유효 포인트 → TF2 변환 (laser_link → map frame)
 //     ↓ Euclidean Clustering
 //   클러스터 목록 (연속된 포인트의 묶음)
 //     ↓ Tracking + EMA 필터
@@ -12,10 +12,25 @@
 //     ↓ 발행
 //   /obstacles/detected (ObstacleArray, map frame)
 //
-// [왜 map frame으로 변환하나?]
-//   LiDAR는 laser_link 좌표계(로봇 시점)에서 데이터를 냄.
-//   MPC의 waypoint와 제어 로직은 map frame(전역 좌표계) 기준.
-//   → 비교/연산을 위해 반드시 같은 좌표계로 맞춰야 함.
+// [하드코딩 제거 설계 방침]
+//   기존 코드는 map_boundary_=2.9, y범위(-0.5~5.8) 등을
+//   맵 크기에 맞춰 하드코딩했음.
+//   → 맵이 바뀔 때마다 코드 수정이 필요했음.
+//
+//   신규 설계: 벽 필터링을 map frame 좌표 기반이 아닌
+//   LiDAR range 기반으로 수행.
+//   → 벽은 항상 range_max 근처에서 잡히고,
+//     장애물은 항상 range_max보다 가까이 있다는 물리적 사실 활용.
+//   → 맵 크기, 로봇 위치, 좌표 범위와 완전히 독립.
+//
+// [파라미터 일람]
+//   max_range_factor    (0.92)  LiDAR range_max의 몇 배 이하만 유효한 장애물로 처리
+//                               → 벽(range_max 근처)을 자동으로 제외
+//   cluster_tolerance   (0.25)  클러스터 병합 거리 임계값 [m]
+//   min_cluster_points  (7)     유효 클러스터 최소 포인트 수
+//   max_cluster_radius  (0.6)   유효 클러스터 최대 반경 [m] (이 이상 = 벽/대형 구조물)
+//   ema_alpha           (0.08)  EMA 필터 가중치 (0~1, 클수록 최신값 반영)
+//   match_dist_thresh   (0.5)   프레임 간 장애물 매칭 최대 거리 [m]
 // ============================================================
 
 #include <rclcpp/rclcpp.hpp>
@@ -26,6 +41,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <cmath>
 #include <vector>
+#include <algorithm>
 
 namespace control_mpc {
 
@@ -45,253 +61,298 @@ struct TrackedObs {
 
 // ============================================================
 // ObstacleTrackerNode — LiDAR 기반 동적 장애물 추적 노드
-//
-// rclcpp::Node를 상속받아 ROS2 노드로 동작.
-// 생성자에서 구독/발행자를 초기화하고,
-// /scan 수신마다 scanCallback()이 자동으로 호출됨.
 // ============================================================
 class ObstacleTrackerNode : public rclcpp::Node {
 public:
-  // ──────────────────────────────────────────────────────────
-  // 생성자 — 노드 초기화
-  //
-  // tf_buffer_ : TF2 변환 정보를 저장하는 버퍼
-  //              lookupTransform()이 이 버퍼에서 변환 행렬을 읽음
-  // tf_listener_: /tf, /tf_static 토픽을 구독해 tf_buffer_를 자동으로 채움
-  // ──────────────────────────────────────────────────────────
-  ObstacleTrackerNode() : Node("obstacle_tracker_node"), tf_buffer_(this->get_clock()), tf_listener_(tf_buffer_) {
-    // 맵 크기 파라미터 — 벽 필터링 기준 (벽 위치 - 여유 0.1m)
-    // 기본값 2.9 = 6×6m 방 기준 (±3.0m 벽 - 0.1m)
-    this->declare_parameter("map_boundary", 2.9);
-    // 장애물 매칭 거리 임계값 [m]
-    // 기본값 0.5 = 속도 0.2m/s 기준 충분한 여유
-    this->declare_parameter("match_dist_thresh", 0.5);
+  ObstacleTrackerNode()
+  : Node("obstacle_tracker_node"),
+    tf_buffer_(this->get_clock()),
+    tf_listener_(tf_buffer_)
+  {
+    // ── 파라미터 선언 ──────────────────────────────────────────
+    //
+    // [max_range_factor]
+    //   LiDAR range_max 대비 유효 장애물 감지 거리 비율.
+    //   기본값 0.92 = range_max의 92% 이내 포인트만 장애물로 처리.
+    //   나머지 8% (벽 등)는 자동 제외.
+    //   → 맵 크기나 LiDAR 스펙이 달라져도 코드 수정 불필요.
+    //   → Gazebo LiDAR range_max가 10m이면 9.2m 이내만 처리.
+    this->declare_parameter("max_range_factor",   0.7);
 
-    map_boundary_      = this->get_parameter("map_boundary").as_double();
-    match_dist_thresh_ = this->get_parameter("match_dist_thresh").as_double();
+    // [cluster_tolerance]
+    //   인접 포인트 간 최대 거리 [m]. 이 이하면 같은 클러스터로 묶음.
+    //   0.25m: 0.3×0.3m 박스 장애물이 여러 조각으로 쪼개지지 않을 최소값.
+    this->declare_parameter("cluster_tolerance",  0.25);
 
-    // [설정] QoS는 LiDAR 센서 데이터에 맞춰 SensorDataQoS를 사용합니다.
+    // [min_cluster_points]
+    //   유효 클러스터로 인정하는 최소 포인트 수.
+    //   7개 미만: 단일 반사점 노이즈 또는 맵 경계 아티팩트로 판단하여 제거.
+    this->declare_parameter("min_cluster_points", 7);
+
+    // [max_cluster_radius]
+    //   클러스터 반경 상한 [m]. 이 이상이면 벽/기둥/대형 구조물로 판단하여 제거.
+    //   0.6m: 단일 장애물(r≈0.15m)과 벽(r>>1m)을 구분하는 임계값.
+    this->declare_parameter("max_cluster_radius", 0.60);
+
+    // [ema_alpha]
+    //   EMA(지수이동평균) 필터 가중치 (0~1).
+    //   smoothed = (1-α)*이전값 + α*새 관측값
+    //   0.08: 새 관측을 8%만 반영 → 강한 평활화, 노이즈 억제 우선.
+    this->declare_parameter("ema_alpha",          0.08);
+
+    // [match_dist_thresh]
+    //   프레임 간 장애물 매칭 최대 거리 [m].
+    //   이 거리 이내에서 가장 가까운 이전 장애물을 같은 장애물로 판단.
+    //   0.5m: 동적 장애물 속도 0.5m/s × 주기 0.1s = 0.05m 이동 → 충분한 여유.
+    this->declare_parameter("match_dist_thresh",  0.50);
+
+    // ── 파라미터 로드 ──────────────────────────────────────────
+    max_range_factor_   = this->get_parameter("max_range_factor").as_double();
+    cluster_tolerance_  = this->get_parameter("cluster_tolerance").as_double();
+    min_cluster_points_ = this->get_parameter("min_cluster_points").as_int();
+    max_cluster_radius_ = this->get_parameter("max_cluster_radius").as_double();
+    ema_alpha_          = this->get_parameter("ema_alpha").as_double();
+    match_dist_thresh_  = this->get_parameter("match_dist_thresh").as_double();
+
+    // ── subscriber / publisher ─────────────────────────────────
     // SensorDataQoS = BEST_EFFORT + 소규모 히스토리
-    // Gazebo의 /scan 브릿지도 BEST_EFFORT로 발행하므로 QoS를 맞춰야 연결됨.
-    // RELIABLE로 설정하면 송신측과 QoS 불일치로 데이터를 수신하지 못함.
+    // Gazebo /scan 브릿지도 BEST_EFFORT로 발행하므로 QoS를 맞춰야 연결됨.
     scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-      "/scan", rclcpp::SensorDataQoS(), std::bind(&ObstacleTrackerNode::scanCallback, this, std::placeholders::_1));
-    
-    obs_pub_ = this->create_publisher<amr_msgs::msg::ObstacleArray>("/obstacles/detected", 10);
-    
-    RCLCPP_INFO(this->get_logger(), "W9 Obstacle Tracker Node가 시작되었습니다. /scan 구독 중...");
+      "/scan", rclcpp::SensorDataQoS(),
+      std::bind(&ObstacleTrackerNode::scanCallback, this, std::placeholders::_1));
+
+    obs_pub_ = this->create_publisher<amr_msgs::msg::ObstacleArray>(
+      "/obstacles/detected", 10);
+
+    RCLCPP_INFO(this->get_logger(),
+      "Obstacle Tracker 시작 | "
+      "range_factor=%.2f cluster_tol=%.2fm min_pts=%d "
+      "max_r=%.2fm ema_α=%.2f match=%.2fm",
+      max_range_factor_, cluster_tolerance_, min_cluster_points_,
+      max_cluster_radius_, ema_alpha_, match_dist_thresh_);
   }
 
 private:
-  // ──────────────────────────────────────────────────────────
-  // scanCallback() — /scan 수신마다 호출되는 메인 콜백 (10Hz)
-  //
-  // [처리 순서]
-  //   1. TF2로 laser_link → map 변환 행렬 획득
-  //   2. 유효한 scan 포인트를 map frame으로 변환 + 필터링
-  //   3. Euclidean Clustering으로 장애물 클러스터 추출
-  //   4. 이전 프레임 장애물과 매칭 → EMA 필터 → 속도 추정
-  //   5. ObstacleArray 메시지 발행
-  // ──────────────────────────────────────────────────────────
-  void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
-    // 1초마다 노드 생존 신고 로그를 출력합니다.
-    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "LiDAR 데이터 수신 및 처리 중...");
+  // ============================================================
+  // scanCallback() — /scan 수신마다 호출 (10Hz)
+  // ============================================================
+  void scanCallback(const sensor_msgs::msg::LaserScan::SharedPtr msg)
+  {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+      "LiDAR 수신 중 | 감지 장애물: %zu개", tracked_obstacles_.size());
 
     rclcpp::Time current_time = msg->header.stamp;
+
+    // ── TF 획득 ───────────────────────────────────────────────
     geometry_msgs::msg::TransformStamped tf_laser_to_map;
     try {
-      // laser_link에서 map 좌표계로의 변환 정보를 가져옵니다.
-      // lookupTransform("map", frame_id, ...) 의미:
-      //   frame_id(=laser_link) 기준 포인트를 map 기준으로 변환하는 행렬을 반환.
-      // tf2::TimePointZero = "가장 최신 TF를 써라" (시간 동기화 없이)
-      tf_laser_to_map = tf_buffer_.lookupTransform("map", msg->header.frame_id, tf2::TimePointZero);
-    } catch (tf2::TransformException &ex) {
-      // slam_toolbox 초기화 중이거나 map frame이 아직 발행 안 된 경우.
-      // 이번 프레임은 건너뛰고 다음 콜백을 기다림.
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "TF 대기 중 (map frame이 필요합니다): %s", ex.what());
-      return; 
+      tf_laser_to_map = tf_buffer_.lookupTransform(
+        "map", msg->header.frame_id, tf2::TimePointZero);
+    } catch (tf2::TransformException & ex) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+        "TF 대기 중: %s", ex.what());
+      return;
     }
 
-    // ── STEP 1: scan 포인트 → map frame 변환 + 필터링 ─────────
-    // LiDAR scan 데이터 구조:
-    //   ranges[i] = i번째 각도 방향의 거리 [m]
-    //   angle = angle_min + i * angle_increment [rad]
-    //   → 극좌표(r, angle) → laser_link 직교좌표(x,y) → map frame 변환
+    // ── STEP 1: 유효 포인트 추출 ──────────────────────────────
     //
-    // 필터링 조건:
-    //   inf/nan          : 반사 없음(유리면 등) → 제거
-    //   range_min 미만   : 로봇 자체 반사 → 제거
-    //   range_max 초과   : 센서 유효 범위 초과 → 제거
-    //   방 경계(2.1m) 초과: 벽 포인트 → 제거 (클러스터링 오류 방지)
+    // [벽 필터링 전략 — range 기반]
+    //   기존: map frame 절대 좌표(x < 2.9, y 범위) → 맵 크기에 종속
+    //   신규: LiDAR range < range_max * max_range_factor_ → 맵 크기 무관
+    //
+    //   물리적 근거:
+    //     벽 → LiDAR에서 range_max 근처로 잡힘
+    //     장애물 → 벽보다 가까이 있어 range가 작음
+    //   따라서 range_max의 일정 비율 이상인 포인트 = 벽으로 판단하여 제거.
+    //   → 맵이 어떤 크기여도, LiDAR 스펙이 달라져도 동작.
+    //
+    // [필터 조건 요약]
+    //   ① inf/nan, range_min 미만, range_max 초과: 센서 무효값 → 제거
+    //   ② range >= range_max * max_range_factor_: 벽으로 판단 → 제거
+    //   ③ 나머지: 장애물 후보 → map frame으로 변환 후 클러스터링
+    double effective_max_range = msg->range_max * max_range_factor_;
+
     std::vector<std::pair<double, double>> valid_points;
+    valid_points.reserve(msg->ranges.size());
+
     for (size_t i = 0; i < msg->ranges.size(); ++i) {
       double r = msg->ranges[i];
-      // 유효하지 않은 range 값 제거
-      if (std::isinf(r) || std::isnan(r) || r < msg->range_min || r > msg->range_max) continue;
-      
-      // 극좌표 → laser_link frame 직교좌표 변환
-      // lx = r * cos(θ),  ly = r * sin(θ)
-      double angle = msg->angle_min + i * msg->angle_increment;
+
+      // ① 센서 무효값 제거
+      if (std::isinf(r) || std::isnan(r) ||
+          r < msg->range_min || r > msg->range_max) {
+        continue;
+      }
+
+      // ② 벽 필터링: range_max 근처 포인트 제거
+      // 코드 수정 없이 맵 크기에 독립적으로 동작하는 핵심 로직
+      if (r >= effective_max_range) {
+        continue;
+      }
+
+      // ③ laser frame 극좌표 → 직교좌표 변환
+      double angle = msg->angle_min + static_cast<double>(i) * msg->angle_increment;
       geometry_msgs::msg::PointStamped pt_laser, pt_map;
       pt_laser.point.x = r * std::cos(angle);
       pt_laser.point.y = r * std::sin(angle);
-      // tf2::doTransform: laser_link frame → map frame 변환 (회전 + 평행이동)
+      pt_laser.point.z = 0.0;
+
+      // laser_link → map frame 변환
       tf2::doTransform(pt_laser, pt_map, tf_laser_to_map);
-      
-      // 방 경계(2.3m) 외곽은 무시합니다.
-      // simple_room(5×5m) 기준 중심에서 ±2.5m가 최대이므로
-      // 2.1m로 제한해서 벽 포인트가 클러스터링에 섞이지 않도록 차단
-      if (std::abs(pt_map.point.x) > map_boundary_ ||
-          pt_map.point.y < -0.5 || pt_map.point.y > 5.8) continue;
+
       valid_points.push_back({pt_map.point.x, pt_map.point.y});
     }
 
     // ── STEP 2: Euclidean Clustering ──────────────────────────
-    // [알고리즘]
-    //   scan 포인트는 각도 순서로 정렬되어 있으므로,
-    //   인접한 포인트끼리 거리가 cluster_tol 이하면 같은 클러스터로 묶음.
-    //   마지막으로 추가된 포인트와만 비교하는 순차 방식.
-    //   (BFS보다 단순하지만, scan이 각도 순 정렬이라 실용상 충분함)
     //
-    // cluster_tol = 0.25m 기준:
-    //   너무 크면 서로 다른 장애물이 하나로 합쳐짐.
-    //   너무 작으면 장애물이 여러 조각으로 쪼개짐.
+    // scan 포인트는 각도 순서로 정렬되어 있으므로
+    // 인접 포인트 간 거리가 cluster_tolerance_ 이하면 같은 클러스터로 묶음.
+    // cluster_tolerance_ 파라미터로 런타임 조정 가능.
     std::vector<std::vector<std::pair<double, double>>> clusters;
-    double cluster_tol = 0.25; 
-    for (const auto& pt : valid_points) {
-      if (clusters.empty()) { clusters.push_back({pt}); } 
-      else {
-        auto& last_c = clusters.back();
-        // 현재 포인트와 클러스터 마지막 포인트 사이 거리 비교
-        if (std::hypot(pt.first - last_c.back().first, pt.second - last_c.back().second) < cluster_tol) {
-          last_c.push_back(pt);    // 가까우면 현재 클러스터에 추가
-        } else { clusters.push_back({pt}); }   // 멀면 새 클러스터 시작
+
+    for (const auto & pt : valid_points) {
+      if (clusters.empty()) {
+        clusters.push_back({pt});
+      } else {
+        auto & last_c = clusters.back();
+        double dist = std::hypot(
+          pt.first  - last_c.back().first,
+          pt.second - last_c.back().second);
+        if (dist < cluster_tolerance_) {
+          last_c.push_back(pt);   // 기존 클러스터에 추가
+        } else {
+          clusters.push_back({pt}); // 새 클러스터 시작
+        }
       }
     }
 
-    // ── STEP 3: Tracking + EMA 필터 + 속도 추정 ───────────────
-    // [Tracking이 필요한 이유]
-    //   클러스터링만 하면 프레임마다 새 장애물 목록이 생성됨 → 속도 추정 불가.
-    //   이전 프레임의 같은 장애물과 매칭하면:
-    //     ① 속도 추정: Δposition / Δtime (1차 차분)
-    //     ② 노이즈 억제: EMA 필터 적용
-    //
-    // [EMA 필터 (지수이동평균, Exponential Moving Average)]
-    //   smoothed = (1-α) * 이전값 + α * 새 관측값
-    //   α = 0.2 → 새 관측을 20%만 반영, 이전 값 80% 유지
-    //   → 한 프레임에서 급격히 튀는 값을 억제 (저역통과필터 효과)
-    //   α가 클수록: 최신 값에 빠르게 반응하지만 노이즈에 민감
-    //   α가 작을수록: 부드럽지만 실제 변화에 느리게 반응
-    //
-    // [매칭 방식: 최근접 이웃 (Nearest Neighbor)]
-    //   새 클러스터 centroid와 이전 프레임 장애물 목록 비교.
-    //   거리 0.8m 이내에서 가장 가까운 것 = 같은 장애물로 판단.
-    //   0.8m 기준: 0.30 m/s × 0.1s(10Hz) = 0.03m 이동 → 충분한 여유
+    // ── STEP 3: 클러스터 검증 + Tracking + EMA ────────────────
     std::vector<TrackedObs> current_detected;
-    for (const auto& cluster : clusters) {
-      // 포인트 수 7개 미만 클러스터는 노이즈로 판단하고 제거.
-      // 실제 장애물(원기둥 r≈0.15m)은 10Hz scan에서 최소 7~10개 포인트가 잡힘.
-      if (cluster.size() < 7) continue; 
-      
-      // centroid 계산: 클러스터 내 모든 포인트의 좌표 평균
-      double cx = 0, cy = 0;
-      for (const auto& p : cluster) { cx += p.first; cy += p.second; }
-      cx /= cluster.size(); cy /= cluster.size();
-      
-      // radius 계산: centroid에서 가장 먼 포인트까지의 거리
-      // 이 값이 장애물 "크기(반경)"의 추정값이 됨
-      double max_d = 0;
-      for (const auto& p : cluster) max_d = std::max(max_d, std::hypot(p.first-cx, p.second-cy));
-      double radius = max_d; // 여유분 축소
-      // 추가: 반경 0.6m 초과 = 격벽/벽 클러스터 → 스킵
-      if (radius > 0.6) continue;
+    current_detected.reserve(clusters.size());
 
-      // 이전 프레임 장애물과 매칭 (최근접 이웃 탐색)
-      // matched_idx: 매칭된 이전 장애물의 인덱스 (-1이면 새 장애물)
-      // min_match_dist: 탐색 중 발견된 최소 거리 (초기값 = 허용 최대 거리)
-      int matched_idx = -1;
+    for (const auto & cluster : clusters) {
+
+      // 최소 포인트 수 미달 → 노이즈로 제거
+      // min_cluster_points_ 파라미터로 런타임 조정 가능
+      if (static_cast<int>(cluster.size()) < min_cluster_points_) continue;
+
+      // centroid 계산: 클러스터 내 모든 포인트의 좌표 평균
+      double cx = 0.0, cy = 0.0;
+      for (const auto & p : cluster) { cx += p.first; cy += p.second; }
+      cx /= static_cast<double>(cluster.size());
+      cy /= static_cast<double>(cluster.size());
+
+      // radius 계산: centroid에서 가장 먼 포인트까지의 거리
+      double max_d = 0.0;
+      for (const auto & p : cluster) {
+        max_d = std::max(max_d, std::hypot(p.first - cx, p.second - cy));
+      }
+      double radius = max_d;
+
+      // 최대 반경 초과 → 벽/대형 구조물로 제거
+      // max_cluster_radius_ 파라미터로 런타임 조정 가능
+      if (radius > max_cluster_radius_) continue;
+
+      // ── 이전 프레임과 매칭 (최근접 이웃) ──────────────────────
+      // 거리 match_dist_thresh_ 이내에서 가장 가까운 이전 장애물 탐색
+      int    matched_idx    = -1;
       double min_match_dist = match_dist_thresh_;
+
       for (size_t i = 0; i < tracked_obstacles_.size(); ++i) {
-        double d = std::hypot(cx - tracked_obstacles_[i].x, cy - tracked_obstacles_[i].y);
-        if (d < min_match_dist) { min_match_dist = d; matched_idx = i; }
+        double d = std::hypot(
+          cx - tracked_obstacles_[i].x,
+          cy - tracked_obstacles_[i].y);
+        if (d < min_match_dist) {
+          min_match_dist = d;
+          matched_idx    = static_cast<int>(i);
+        }
       }
 
       TrackedObs obs;
       obs.last_seen = current_time;
-      if (matched_idx != -1) {
-        // ── 매칭 성공: 이전 장애물과 동일 → EMA 필터 + 속도 추정 ──
-        double alpha = 0.08; // EMA 필터 가중치 (값이 작을수록 부드러워짐)
-        obs.id = tracked_obstacles_[matched_idx].id;  // 기존 ID 유지
 
-        // EMA 위치 필터: 급격한 위치 튐 억제 (이전 80% + 새 관측 20%)
-        obs.x = (1.0 - alpha) * tracked_obstacles_[matched_idx].x + alpha * cx;
-        obs.y = (1.0 - alpha) * tracked_obstacles_[matched_idx].y + alpha * cy;
-        // EMA 반경 필터: 반경 추정도 부드럽게 유지
-        obs.radius = (1.0 - alpha) * tracked_obstacles_[matched_idx].radius + alpha * radius;
-        
-        // 속도 추정: 1차 차분 (Δposition / Δtime) + EMA 필터
-        // dt: 이전 프레임과 현재 프레임 사이의 실제 시간 간격 (10Hz면 ≈0.1s)
-        double dt = (current_time - tracked_obstacles_[matched_idx].last_seen).seconds();
-        if (dt > 0) {
-          // raw 속도: EMA 필터 적용 전 순수 차분 속도 [m/s]
-          double rx = (obs.x - tracked_obstacles_[matched_idx].x) / dt;
-          double ry = (obs.y - tracked_obstacles_[matched_idx].y) / dt;
-          // EMA 속도 필터: 속도는 위치보다 노이즈에 훨씬 민감하므로 강하게 평활화
-          obs.vx = (1.0 - alpha) * tracked_obstacles_[matched_idx].vx + alpha * rx;
-          obs.vy = (1.0 - alpha) * tracked_obstacles_[matched_idx].vy + alpha * ry;
+      if (matched_idx != -1) {
+        // ── 매칭 성공: EMA 필터 + 속도 추정 ──────────────────
+        // ema_alpha_ 파라미터로 런타임 조정 가능
+        const TrackedObs & prev = tracked_obstacles_[matched_idx];
+        double alpha = ema_alpha_;
+
+        obs.id     = prev.id;
+        obs.x      = (1.0 - alpha) * prev.x      + alpha * cx;
+        obs.y      = (1.0 - alpha) * prev.y      + alpha * cy;
+        obs.radius = (1.0 - alpha) * prev.radius + alpha * radius;
+
+        // 속도 추정: 1차 차분 (Δpos / Δt) + EMA 필터
+        double dt = (current_time - prev.last_seen).seconds();
+        if (dt > 0.0) {
+          double raw_vx = (obs.x - prev.x) / dt;
+          double raw_vy = (obs.y - prev.y) / dt;
+          obs.vx = (1.0 - alpha) * prev.vx + alpha * raw_vx;
+          obs.vy = (1.0 - alpha) * prev.vy + alpha * raw_vy;
+        } else {
+          obs.vx = prev.vx;
+          obs.vy = prev.vy;
         }
-        // dt <= 0이면 속도 계산 불가 → vx, vy는 기본값 0 유지
+
       } else {
-        // ── 매칭 실패: 새로 등장한 장애물 ────────────────────────
-        // 첫 감지 시 속도를 알 수 없으므로 0으로 초기화.
-        // 다음 프레임부터 매칭되면 속도 추정 시작됨.
-        obs.id = next_id_++; obs.x = cx; obs.y = cy; obs.radius = radius; obs.vx = 0.0; obs.vy = 0.0;
+        // ── 매칭 실패: 새 장애물 등록 ─────────────────────────
+        obs.id     = next_id_++;
+        obs.x      = cx;
+        obs.y      = cy;
+        obs.radius = radius;
+        obs.vx     = 0.0;
+        obs.vy     = 0.0;
       }
+
       current_detected.push_back(obs);
     }
-    // 현재 프레임 결과를 저장 → 다음 프레임의 "이전 프레임"으로 사용됨
-    tracked_obstacles_ = current_detected;
 
-    // ── STEP 4: ObstacleArray 메시지 조립 및 발행 ─────────────
-    // amr_msgs::ObstacleArray 구조:
-    //   header: 타임스탬프 + 좌표계 ("map")
-    //   count:  감지된 장애물 수
-    //   x[], y[]: centroid 위치 배열 (map frame)
-    //   vx[], vy[]: 속도 배열 [m/s] — MpcCore::buildQP()의 CV 예측에 사용됨
-    //   radius[]: 추정 반경 배열 [m]
-    // MpcNode::obsCallback()이 이 토픽을 구독해서 setObstacles()로 전달함. [cite: 350]
+    // 현재 프레임 결과 저장 → 다음 프레임의 이전 프레임으로 사용
+    tracked_obstacles_ = std::move(current_detected);
+
+    // ── STEP 4: ObstacleArray 발행 ────────────────────────────
     amr_msgs::msg::ObstacleArray out_msg;
-    out_msg.header.stamp = current_time;
-    out_msg.header.frame_id = "map";   // MPC가 map frame 기준으로 동작하므로 반드시 "map"
-    out_msg.count = tracked_obstacles_.size();
-    for (const auto& o : tracked_obstacles_) {
-      out_msg.x.push_back(o.x); out_msg.y.push_back(o.y);
-      out_msg.vx.push_back(o.vx); out_msg.vy.push_back(o.vy);
+    out_msg.header.stamp    = current_time;
+    out_msg.header.frame_id = "map";
+    out_msg.count           = static_cast<int>(tracked_obstacles_.size());
+
+    for (const auto & o : tracked_obstacles_) {
+      out_msg.x.push_back(o.x);
+      out_msg.y.push_back(o.y);
+      out_msg.vx.push_back(o.vx);
+      out_msg.vy.push_back(o.vy);
       out_msg.radius.push_back(o.radius);
     }
+
     obs_pub_->publish(out_msg);
   }
 
   // ── 멤버 변수 ─────────────────────────────────────────────
-  tf2_ros::Buffer tf_buffer_;               // TF2 변환 정보 버퍼 (lookupTransform이 여기서 읽음)
-  tf2_ros::TransformListener tf_listener_;  // /tf 토픽 구독 → tf_buffer_ 자동 갱신
-  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;  // /scan 구독자
-  rclcpp::Publisher<amr_msgs::msg::ObstacleArray>::SharedPtr obs_pub_;     // /obstacles/detected 발행자
-  std::vector<TrackedObs> tracked_obstacles_;  // 현재 추적 중인 장애물 목록 (프레임 간 유지됨)
-  int next_id_ = 0;  // 장애물 ID 카운터 (새 장애물 등장마다 1씩 증가, 디버깅용)
-  double map_boundary_      = 2.9;
-  double match_dist_thresh_ = 0.5;
+  tf2_ros::Buffer           tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
+  rclcpp::Publisher<amr_msgs::msg::ObstacleArray>::SharedPtr   obs_pub_;
+
+  std::vector<TrackedObs> tracked_obstacles_;
+  int next_id_ = 0;
+
+  // 파라미터 (모두 런타임 로드, 하드코딩 없음)
+  double max_range_factor_;    // LiDAR range_max 대비 유효 감지 비율
+  double cluster_tolerance_;   // 클러스터 병합 거리 [m]
+  int    min_cluster_points_;  // 최소 유효 클러스터 포인트 수
+  double max_cluster_radius_;  // 최대 클러스터 반경 [m] (벽 제거 기준)
+  double ema_alpha_;           // EMA 필터 가중치
+  double match_dist_thresh_;   // 프레임 간 매칭 최대 거리 [m]
 };
-}
+
+}  // namespace control_mpc
 
 // ============================================================
-// main() — 노드 진입점
-//
-// rclcpp::spin(): 무한 루프로 콜백 대기
-//   → /scan 수신마다 scanCallback() 자동 호출
-//   → Ctrl+C 시 spin() 탈출 → shutdown()
+// main()
 // ============================================================
-int main(int argc, char** argv) {
+int main(int argc, char ** argv)
+{
   rclcpp::init(argc, argv);
   rclcpp::spin(std::make_shared<control_mpc::ObstacleTrackerNode>());
   rclcpp::shutdown();

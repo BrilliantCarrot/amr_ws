@@ -123,7 +123,7 @@
     <!-- 동쪽 벽 -->
     <model name="wall_east">
       <static>true</static>
-      <pose>12.5 0 0.5 0 0 0</pose>
+      <pose>7.0 0 0.5 0 0 0</pose>
       <link name="link">
         <collision name="collision">
           <geometry><box><size>0.1 5.0 1.0</size></box></geometry>

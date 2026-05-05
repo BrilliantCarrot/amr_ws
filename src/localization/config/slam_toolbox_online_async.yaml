@@ -41,6 +41,10 @@ slam_toolbox:
     # (대안: HuberLoss → 매칭 오차가 크면 영향력을 줄임, 노이즈 많은 환경에 유리)
     ceres_loss_function: None
 
+    num_threads: 4
+
+    num_for_global: 4
+
     # ================================================================
     # [2] 토픽 / 프레임 설정
     #
@@ -79,15 +83,17 @@ slam_toolbox:
     # slam 맵 생성과 위치 추정 두 개에서 모드를 다르게 사용해야 함
     # mapping:      맵을 새로 만드는 모드, mapping 일 경우 map_start_at_dock과 map_file_name을 주석처리
     # localization: 저장된 맵 위에서 위치만 추정하는 모드
-    mode: localization
     # mode: mapping
-    # mapping일때 주석처리
+    mode: localization
+    # mapping일때 밑에 줄 주석처리
     map_start_at_dock: true
     # 저장된 맵 경로 (확장자 없이 입력)
     # slam_toolbox가 .pgm + .yaml 쌍을 자동으로 로드함
     # map_file_name: /home/lyj/amr_ws/maps/amr_map
     # map_file_name: /home/lyj/amr_ws/maps/amr_map_empty
-    map_file_name: /home/lyj/amr_ws/maps/monte_carlo_map
+    map_file_name: /home/lyj/amr_ws/maps/test_map
+    # map_file_name: /home/lyj/amr_ws/maps/test_room_dynamic
+    # map_file_name: /home/lyj/isaac_amr_ws/maps/isaac_warehouse_map
 
     # ================================================================
     # [3] 일반 동작 설정

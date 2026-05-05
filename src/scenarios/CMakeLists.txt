@@ -28,5 +28,9 @@ install(PROGRAMS
   scripts/obstacle_controller_node.py
   DESTINATION lib/${PROJECT_NAME}
 )
+install(PROGRAMS
+  scripts/obstacle_marker_node.py
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 ament_package()

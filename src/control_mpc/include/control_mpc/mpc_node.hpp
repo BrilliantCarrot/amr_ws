@@ -38,6 +38,8 @@
 #include <nav_msgs/msg/path.hpp>               // 글로벌 경로계획 연동 (W12 추가)
 #include "control_mpc/mpc_core.hpp"
 #include "amr_msgs/msg/min_obstacle_distance.hpp" // w8 min clearance 발행용
+#include "control_mpc/cbf_filter.hpp"
+#include <memory>
 
 namespace control_mpc
 {
@@ -230,6 +232,47 @@ private:
 
   double prev_raw_theta_    = 0.0;   // 직전 raw atan2 yaw 값 (래핑 delta 계산용)
   double continuous_theta_  = 0.0;   // 누적 연속 yaw (래핑 없는 절대값)
+  // ── CBF Safety Filter ──────────────────────────────────────
+  // MPC 출력 u_nom → CBF-QP → u_safe 파이프라인
+  std::unique_ptr<CbfFilter> cbf_filter_;
+
+  // CBF 파라미터 (생성자에서 로드)
+  double cbf_gamma_   = 1.0;    // class-K 계수
+  double cbf_slack_p_ = 500.0;  // soft slack 페널티
+  double cbf_d_safe_  = 0.0;    // 추가 안전 마진 [m]
+  bool   cbf_enabled_ = true;   // CBF 활성화 여부 (런타임 토글용)
+
+  // ──────────────────────────────────────────────────────────
+  // 도킹 관련 멤버
+  //
+  //   미션 단계:
+  //     NAVIGATING → A* waypoint 추종 중
+  //     DOCKING    → 마지막 waypoint 도달 후 dock 포즈 정밀 정렬
+  //     DOCKED     → 완료 판정 통과, 정지 유지
+  //
+  //   dock_x_, dock_y_: NAVIGATING→DOCKING 전환 시
+  //                     waypoints_.back() 위치로 자동 갱신
+  //   dock_yaw_       : 파라미터 "dock_yaw" [rad]으로 외부 설정
+  // ──────────────────────────────────────────────────────────
+  enum class MissionPhase : uint8_t {
+    NAVIGATING = 0,  // A* 경로 추종 중
+    DOCKING    = 1,  // dock 포즈 수렴 중
+    DOCKED     = 2   // 도킹 완료, 정지 유지
+  };
+  MissionPhase mission_phase_ = MissionPhase::NAVIGATING;
+
+  // 도킹 목표 포즈 (map frame)
+  double dock_x_   = 0.0;  // 마지막 waypoint x (자동 설정)
+  double dock_y_   = 0.0;  // 마지막 waypoint y (자동 설정)
+  double dock_yaw_ = 0.0;  // 도킹 목표 헤딩 [rad] (파라미터)
+
+  // 도킹 완료 판정 임계값
+  double dock_pos_tol_ = 0.0;  // 위치 허용 오차 [m]  (파라미터 "dock_pos_tol")
+  double dock_yaw_tol_ = 0.0;  // 헤딩 허용 오차 [rad] (파라미터 "dock_yaw_tol_deg")
+
+  // 도킹 전용 reference 생성
+  // N+1개를 모두 dock 포즈로 채워 MPC가 수렴하도록 유도
+  std::vector<StateVec> generateDockingReference(const StateVec & x0);
 };
 
 }  // namespace control_mpc

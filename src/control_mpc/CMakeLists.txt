@@ -28,6 +28,7 @@ add_executable(mpc_node
   src/mpc_core.cpp
   src/mpc_node.cpp
   src/main.cpp
+  src/cbf_filter.cpp
 )
 
 ament_target_dependencies(mpc_node

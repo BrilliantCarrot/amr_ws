@@ -529,14 +529,75 @@ void MpcCore::buildQP(
   //     - grad_x = 0.0 (브레이크 없이 측면 우회만)
   //     - grad_y *= 2.0 (측면 회피력 강화)
 
-  StateVec x_sim = x0;  // 현재 상태에서 forward simulation 시작
-  for (int k = 1; k <= N; ++k) {
-    const double px  = x_sim(0);  // k스텝 후 로봇 예측 위치 x
-    const double py  = x_sim(1);  // k스텝 후 로봇 예측 위치 y
-    const double pth = x_sim(2);  // k스텝 후 로봇 예측 heading θ
-    int idx = k * NX;             // z 벡터에서 x_k 시작 인덱스
+  // ── active obstacle selection ─────────────────────────────
+  // 너무 멀거나 뒤에 있는 장애물까지 모두 penalty에 넣으면
+  // MPC가 보수적으로 굳어서 정지 해를 선택하기 쉬움
+  // 1. 구조체 정의
+  struct ObsCandidate {
+    Obstacle obs;
+    double clearance;
+    double forward_proj;
+  };
 
-    for (const auto & obs : obstacles_) {
+  // 2. 후보 탐색 (obstacles_를 순회)
+  std::vector<ObsCandidate> active_candidates;
+  active_candidates.reserve(obstacles_.size());
+
+  const double heading_x0 = std::cos(x0(2));
+  const double heading_y0 = std::sin(x0(2));
+
+  for (const auto & obs : obstacles_) {  // ← active_obstacles 아닌 obstacles_
+    double dx = obs.x - x0(0);
+    double dy = obs.y - x0(1);
+    double center_dist  = std::hypot(dx, dy);
+    double clearance    = center_dist - obs.radius;
+    double forward_proj = dx * heading_x0 + dy * heading_y0;
+
+    if (forward_proj < -0.05) continue;
+    if (clearance > 1.2) continue;
+
+    active_candidates.push_back({obs, clearance, forward_proj});
+  }
+
+  // 3. 가까운 순 정렬 후 최대 3개만 유지
+  std::sort(active_candidates.begin(), active_candidates.end(),
+    [](const ObsCandidate & a, const ObsCandidate & b) {
+      return a.clearance < b.clearance;
+    });
+
+  if (active_candidates.size() > 3) {
+    active_candidates.resize(3);
+  }
+
+  // 4. active_obstacles 추출
+  std::vector<Obstacle> active_obstacles;
+  active_obstacles.reserve(active_candidates.size());
+  for (const auto & c : active_candidates) {
+    active_obstacles.push_back(c.obs);
+  }
+
+  StateVec x_sim = x0;  // 현재 상태에서 rollout 시작
+
+  for (int k = 1; k <= N; ++k) {
+    // safety filter가 직전 스텝에서 v를 줄였더라도
+    // MPC penalty rollout은 "계획 의도"를 볼 수 있게
+    // reference 속도를 기준으로 약한 전진 가정을 둠
+    double v_roll = std::clamp(x_ref[k - 1](3), 0.04, params_.v_max);
+    double w_roll = std::clamp(x_ref[k - 1](4), params_.w_min, params_.w_max);
+
+    x_sim(0) += v_roll * std::cos(x_sim(2)) * params_.dt;
+    x_sim(1) += v_roll * std::sin(x_sim(2)) * params_.dt;
+    x_sim(2) += w_roll * params_.dt;
+    x_sim(3) = v_roll;
+    x_sim(4) = w_roll;
+
+    const double px  = x_sim(0);
+    const double py  = x_sim(1);
+    const double pth = x_sim(2);
+
+    int idx = k * NX;
+
+    for (const auto & obs : active_obstacles) {
       // 속도 폭주 방지: 추정 속도를 ±0.6 m/s로 클램핑
       // obstacle_tracker의 EMA 필터가 튀는 값을 내보낼 경우 대비
       double safe_vx = std::clamp(obs.vx, -0.6, 0.6);
@@ -594,8 +655,8 @@ void MpcCore::buildQP(
       // 정적/동적에 따라 다른 파라미터 적용
       // 정적: 하드코딩 값 (파라미터 독립적, 보수적 튜닝)
       // 동적: params_에서 로드한 값 (런타임 조정 가능)
-      double applied_safe_dist = is_dynamic ? params_.obs_safe_dist : 0.50;
-      double applied_weight    = is_dynamic ? params_.obs_weight    : 80.0;
+      double applied_safe_dist = is_dynamic ? params_.obs_safe_dist : 0.30;
+      double applied_weight    = is_dynamic ? params_.obs_weight    : 20.0;
 
       double violation = applied_safe_dist - d_eff;
       if (violation <= 0.0) continue;  // 안전 거리 밖 → 페널티 없음
@@ -643,8 +704,9 @@ void MpcCore::buildQP(
         double grad_lateral = -grad_x * sin_th + grad_y * cos_th;  // 측면 성분
 
         // 로컬 프레임에서 힘 조절
-        grad_forward = std::min(grad_forward, 0.0); // 진행방향 힘 완전 제거 → 브레이크/가속 없이 전진 유지
-        grad_lateral *= 5.0;     // 측면 힘 n배 강화 → 충분한 측면 우회 유도
+        // grad_forward = std::min(grad_forward, 0.0); // 진행방향 힘 완전 제거 → 브레이크/가속 없이 전진 유지
+        grad_forward = 0.0;
+        grad_lateral *= 1.5; // 측면 힘 n배 강화 → 충분한 측면 우회 유도
 
         // 로컬 프레임 → 글로벌 프레임 역변환
         grad_x = grad_forward * cos_th - grad_lateral * sin_th;
@@ -654,7 +716,7 @@ void MpcCore::buildQP(
         // 동적 장애물: x방향 힘 절반으로 줄여 움직임의 연속성 확보
         // 완전히 끄면 전후 궤적 토막남 → 0.5로 완화
         // (동적 장애물은 횡단 접근이 많아 x, y 양방향 힘이 모두 필요함)
-        grad_x *= 0.5;
+        grad_x *= 0.3;
         // grad_y는 원본값 유지 — 동적 장애물 y방향 회피력 그대로 사용
       }
 
@@ -666,14 +728,9 @@ void MpcCore::buildQP(
       q_vec_(idx + 0) += grad_x;
       q_vec_(idx + 1) += grad_y;
     }
-
-    // Forward Kinematics로 다음 스텝 로봇 예측 위치 갱신
-    // v, ω는 현재 값(x0의 v, ω)을 상수로 유지한다고 가정 (단순화)
-    // 실제 QP 해는 다를 수 있지만, penalty 계산용 근사로는 충분
-    x_sim(0) += x_sim(3) * std::cos(x_sim(2)) * params_.dt;
-    x_sim(1) += x_sim(3) * std::sin(x_sim(2)) * params_.dt;
-    x_sim(2) += x_sim(4) * params_.dt;
   }
+
+  
 
   (void)u_prev;   // 향후 입력 연속성 제약 확장 시 사용 예정
 }
