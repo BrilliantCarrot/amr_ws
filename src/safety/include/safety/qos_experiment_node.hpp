@@ -26,7 +26,7 @@
 //   파라미터 'reliability' = "reliable"    → RELIABLE QoS
 //   파라미터 'reliability' = "best_effort" → BEST_EFFORT QoS
 //   노드 실행 시 파라미터로 지정:
-//     ros2 run safety qos_experiment_node \
+//     ros2 run safety qos_experiment_node
 //       --ros-args -p reliability:=best_effort
 //
 // [발행 토픽]

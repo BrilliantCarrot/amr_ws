@@ -49,6 +49,7 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   // true: path_planner_node의 /planned_path 수신 후 제어 시작
   // false: 기존 hardcoded 경로(trajectory_type) 사용 (하위호환)
   this->declare_parameter("use_global_planner", false);
+  this->declare_parameter("enable_docking", true);
 
   // 도킹 관련 파라미터 선언
   // dock_yaw: 도킹 목표 헤딩 [rad] — 예) 1.5708 = 90° (좌측 도킹)
@@ -77,6 +78,7 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   slip_ratio_       = this->get_parameter("slip_ratio").as_double();
   artificial_load_ms_ = this->get_parameter("artificial_load_ms").as_double();
   use_global_planner_ = this->get_parameter("use_global_planner").as_bool();
+  enable_docking_ = this->get_parameter("enable_docking").as_bool();
 
   // 도킹 파라미터 로드
   dock_yaw_     = this->get_parameter("dock_yaw").as_double();
@@ -565,6 +567,12 @@ void MpcNode::controlCallback()
   // ── NAVIGATING → DOCKING 전환 ──────────────────────────────
   // A* 경로의 마지막 waypoint 도달(mission_done_) 시 정지 대신 DOCKING 진입
   // dock_x_, dock_y_를 마지막 waypoint 위치(= path_planner의 goal)로 확정
+  if (!enable_docking_ && local_mission_done) {
+    mission_phase_ = MissionPhase::DOCKED;
+    publishStop();
+    return;
+  }
+
   if (mission_phase_ == MissionPhase::NAVIGATING && local_mission_done) {
     {
       std::lock_guard<std::mutex> lock(state_mutex_);

@@ -66,6 +66,7 @@ ament_target_dependencies(obstacle_tracker_node
 ament_target_dependencies(tracking_rmse_node
   rclcpp
   geometry_msgs
+  nav_msgs
   tf2_msgs
   amr_msgs
   tf2

@@ -26,7 +26,7 @@ LqrNode::LqrNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("r_dw",   5.0);
 
   // 속도 제한 (MPC와 동일 기본값)
-  this->declare_parameter("v_max",   0.5);
+  this->declare_parameter("v_max",   0.15);
   this->declare_parameter("v_min",  -0.1);
   this->declare_parameter("w_max",   1.0);
   this->declare_parameter("w_min",  -1.0);
@@ -37,7 +37,7 @@ LqrNode::LqrNode(const rclcpp::NodeOptions & options)
 
   // 경로/제어 파라미터
   this->declare_parameter("v_ref_",         0.1);
-  this->declare_parameter("goal_tolerance",  0.20);
+  this->declare_parameter("goal_tolerance",  0.15);
   this->declare_parameter("dt",             0.02);
 
   // 제어기 검증용 

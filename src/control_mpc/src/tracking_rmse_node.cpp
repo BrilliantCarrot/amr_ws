@@ -1,13 +1,18 @@
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_msgs/msg/tf_message.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/path.hpp>
 #include <amr_msgs/msg/pose_rmse.hpp>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2/utils.h>
 
+#include <algorithm>
 #include <cmath>
 #include <deque>
+#include <limits>
 #include <string>
+#include <utility>
+#include <vector>
 
 // ============================================================
 // tracking_rmse_node.cpp — MPC 추종 오차 실시간 계산 노드
@@ -70,6 +75,11 @@ public:
     this->declare_parameter<std::string>("robot_name", "amr_robot");
     robot_name_ = this->get_parameter("robot_name").as_string();
 
+    // true이면 controller별 reference_pose 대신 공통 /planned_path에 대한
+    // closest-point error를 계산한다. MPC/LQR 비교 실험에서 공정한 지표로 사용.
+    this->declare_parameter<bool>("use_path_error", false);
+    use_path_error_ = this->get_parameter("use_path_error").as_bool();
+
     auto reliable_qos = rclcpp::QoS(10).reliable();
     auto sensor_qos   = rclcpp::SensorDataQoS();
 
@@ -100,6 +110,12 @@ public:
       std::bind(&TrackingRmseNode::refCallback, this, std::placeholders::_1)
     );
 
+    path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
+      "/planned_path",
+      reliable_qos,
+      std::bind(&TrackingRmseNode::pathCallback, this, std::placeholders::_1)
+    );
+
     // 추종 오차 발행 (/metrics/tracking_rmse)
     // amr_msgs/PoseRmse 재사용: rmse_x, rmse_y, rmse_yaw, rmse_total
     rmse_pub_ = this->create_publisher<amr_msgs::msg::PoseRmse>(
@@ -115,10 +131,82 @@ public:
     RCLCPP_INFO(this->get_logger(),
       "[TrackingRmseNode] Ref: /mpc/reference_pose");
     RCLCPP_INFO(this->get_logger(),
+      "[TrackingRmseNode] Path error mode: %s", use_path_error_ ? "ON" : "OFF");
+    RCLCPP_INFO(this->get_logger(),
       "[TrackingRmseNode] 발행: /metrics/tracking_rmse");
   }
 
 private:
+  void pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
+  {
+    std::vector<std::pair<double, double>> pts;
+    pts.reserve(msg->poses.size());
+    for (const auto & pose : msg->poses) {
+      pts.emplace_back(pose.pose.position.x, pose.pose.position.y);
+    }
+
+    if (pts.empty()) {
+      return;
+    }
+
+    path_points_ = std::move(pts);
+    has_path_ = true;
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+      "[TrackingRmseNode] /planned_path 수신: %zu pts", path_points_.size());
+  }
+
+  bool closestPathPose(double x, double y, double & ref_x, double & ref_y, double & ref_yaw)
+  {
+    if (!has_path_ || path_points_.empty()) {
+      return false;
+    }
+
+    if (path_points_.size() == 1) {
+      ref_x = path_points_[0].first;
+      ref_y = path_points_[0].second;
+      ref_yaw = gt_yaw_;
+      return true;
+    }
+
+    double best_d2 = std::numeric_limits<double>::infinity();
+    double best_x = path_points_[0].first;
+    double best_y = path_points_[0].second;
+    double best_yaw = gt_yaw_;
+
+    for (size_t i = 0; i + 1 < path_points_.size(); ++i) {
+      const double x1 = path_points_[i].first;
+      const double y1 = path_points_[i].second;
+      const double x2 = path_points_[i + 1].first;
+      const double y2 = path_points_[i + 1].second;
+      const double sx = x2 - x1;
+      const double sy = y2 - y1;
+      const double len2 = sx * sx + sy * sy;
+      if (len2 < 1e-12) {
+        continue;
+      }
+
+      const double t = std::clamp(((x - x1) * sx + (y - y1) * sy) / len2, 0.0, 1.0);
+      const double px = x1 + t * sx;
+      const double py = y1 + t * sy;
+      const double dx = x - px;
+      const double dy = y - py;
+      const double d2 = dx * dx + dy * dy;
+
+      if (d2 < best_d2) {
+        best_d2 = d2;
+        best_x = px;
+        best_y = py;
+        best_yaw = std::atan2(sy, sx);
+      }
+    }
+
+    ref_x = best_x;
+    ref_y = best_y;
+    ref_yaw = best_yaw;
+    return std::isfinite(best_d2);
+  }
+
   // --------------------------------------------------------
   // Ground Truth 콜백
   // TFMessage 배열에서 amr_robot 항목을 찾아 위치/yaw 캐싱.  
@@ -185,18 +273,28 @@ private:
     // 오차 계산 시 atan2(sin, cos) 정규화로 처리하므로 문제없음.
     const double ref_yaw = tf2::getYaw(ref_q);
 
+    double eval_ref_x = ref_x;
+    double eval_ref_y = ref_y;
+    double eval_ref_yaw = ref_yaw;
+    if (use_path_error_) {
+      if (!closestPathPose(gt_x_, gt_y_, eval_ref_x, eval_ref_y, eval_ref_yaw)) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+          "[TrackingRmseNode] use_path_error=true이나 /planned_path 미수신. reference_pose 기준으로 fallback.");
+      }
+    }
+
     // --- 오차 계산 ---
-    // GT (실제 위치) - Reference (목표 위치)
-    // 부호 방향: 양수 = GT가 ref보다 앞서 있음
-    const double err_x = gt_x_ - ref_x;
-    const double err_y = gt_y_ - ref_y;
+    // 기본: GT - controller reference
+    // use_path_error=true: GT - /planned_path 위 closest point
+    const double err_x = gt_x_ - eval_ref_x;
+    const double err_y = gt_y_ - eval_ref_y;
 
     // yaw 오차: [-π, π] 범위로 정규화
     // [왜 atan2(sin, cos) 트릭?]
     //   단순 빼기만 하면 -2π ~ 2π 범위가 됨.
     //   예: gt=170°, ref=-170° → 단순 차이=340° (실제는 -20°)
     //   atan2(sin(diff), cos(diff))는 항상 -π ~ π로 정규화
-    const double raw_diff = gt_yaw_ - ref_yaw;
+    const double raw_diff = gt_yaw_ - eval_ref_yaw;
     const double err_yaw  = std::atan2(std::sin(raw_diff), std::cos(raw_diff));
 
     // 2D 유클리드 위치 오차 (방향 무관한 거리)
@@ -259,6 +357,7 @@ private:
   // --- ROS2 인터페이스 ---
   rclcpp::Subscription<tf2_msgs::msg::TFMessage>::SharedPtr              gt_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr       ref_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr                   path_sub_;
   rclcpp::Publisher<amr_msgs::msg::PoseRmse>::SharedPtr                  rmse_pub_;
 
   // --- Ground Truth 캐시 ---
@@ -274,6 +373,9 @@ private:
   int         sample_count_;
   int         window_size_;
   std::string robot_name_;
+  bool        use_path_error_ = false;
+  bool        has_path_ = false;
+  std::vector<std::pair<double, double>> path_points_;
 
   // --- 슬라이딩 윈도우 버퍼 (오차² 저장) ---
   std::deque<double> buf_x_;

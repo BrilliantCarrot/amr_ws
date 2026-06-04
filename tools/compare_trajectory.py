@@ -257,8 +257,8 @@ def print_table(traj_name: str, mpc_s: dict, lqr_s: dict):
     row("  최대 RMSE [m]",          "rmse_max",  "rmse_max")
     row("  RMSE 표준편차 [m]",      "rmse_std",  "rmse_std")
     print(fmt.format("  RMSE 안정화 시간 [s]",
-        f"{mpc_s['stab_time']:.2f}s" if mpc_s.get('stab_time') else "미달",
-        f"{lqr_s['stab_time']:.2f}s" if lqr_s and lqr_s.get('stab_time') else "미달"))
+        f"{mpc_s['stab_time']:.2f}s" if mpc_s.get('stab_time') is not None else "미달",
+        f"{lqr_s['stab_time']:.2f}s" if lqr_s and lqr_s.get('stab_time') is not None else "미달"))
     print(fmt.format("  RMSE 구간별 평균 (Q1/Q2/Q3/Q4)",
         "/".join(f"{mpc_s.get(f'rmse_q{i}',0):.3f}" for i in range(1,5)),
         "/".join(f"{lqr_s.get(f'rmse_q{i}',0):.3f}" for i in range(1,5)) if lqr_s else "N/A"))

@@ -15,6 +15,7 @@ __pycache__/
 bin/
 obj/
 *.exe
+*.vscode
 
 # OS 관련
 .DS_Store
@@ -29,3 +30,4 @@ Thumbs.db
 tsan*
 *.jpg
 logs/
+*.svg

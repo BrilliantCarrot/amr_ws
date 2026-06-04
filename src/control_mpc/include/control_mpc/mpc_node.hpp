@@ -175,6 +175,7 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr path_sub_;
   void pathCallback(const nav_msgs::msg::Path::SharedPtr msg);
   bool use_global_planner_ = false;  // true: /planned_path 대기, false: 하드코딩 경로
+  bool enable_docking_ = true;       // false: 비교 실험에서 목표 도달 시 바로 정지
 
   // 긴급 정지용 — /cmd_vel_delayed 직접 발행 (mock_link 우회)
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr emergency_stop_pub_;
