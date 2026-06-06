@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+
+from manipulation.w7_docking_supervisor_node import main
+
+
+if __name__ == "__main__":
+    main()

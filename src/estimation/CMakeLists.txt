@@ -86,10 +86,22 @@ target_link_libraries(map_ekf_node
   Eigen3::Eigen
 )
 
+add_executable(odom_tf_broadcaster_node
+  src/odom_tf_broadcaster_node.cpp
+)
+
+ament_target_dependencies(odom_tf_broadcaster_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  tf2_ros
+)
+
 install(TARGETS
   ekf_node
   pose_rmse_node
   map_ekf_node
+  odom_tf_broadcaster_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

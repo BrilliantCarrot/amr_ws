@@ -70,7 +70,9 @@ public:
     const std::vector<int8_t> & grid,
     int width, int height,
     int sx, int sy,
-    int gx, int gy) const;
+    int gx, int gy,
+    int clearance_cost_cells = 0,
+    double clearance_cost_weight = 0.0) const;
 };
 
 }  // namespace planning

@@ -90,10 +90,11 @@ slam_toolbox:
     # 저장된 맵 경로 (확장자 없이 입력)
     # slam_toolbox가 .pgm + .yaml 쌍을 자동으로 로드함
     # map_file_name: /home/lyj/amr_ws/maps/amr_map
-    map_file_name: /home/lyj/amr_ws/maps/amr_map_empty
+    # map_file_name: /home/lyj/amr_ws/maps/amr_map_empty
     # map_file_name: /home/lyj/amr_ws/maps/test_map
     # map_file_name: /home/lyj/amr_ws/maps/test_room_dynamic
     # map_file_name: /home/lyj/isaac_amr_ws/maps/isaac_warehouse_map
+    map_file_name: /home/lyj/amr_ws/maps/monte_carlo_map
 
     # ================================================================
     # [3] 일반 동작 설정

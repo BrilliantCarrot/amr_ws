@@ -36,6 +36,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>   // x_ref[0] → /mpc/reference_pose 발행용
 #include <amr_msgs/msg/obstacle_array.hpp>
 #include <nav_msgs/msg/path.hpp>               // 글로벌 경로계획 연동 (W12 추가)
+#include <std_msgs/msg/string.hpp>
 #include "control_mpc/mpc_core.hpp"
 #include "amr_msgs/msg/min_obstacle_distance.hpp" // w8 min clearance 발행용
 #include "control_mpc/cbf_filter.hpp"
@@ -141,6 +142,7 @@ private:
   rclcpp::Subscription<amr_msgs::msg::SafetyStatus>::SharedPtr safety_sub_;
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr           cmd_vel_pub_;
   rclcpp::Publisher<amr_msgs::msg::ControlLatency>::SharedPtr       latency_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr                mission_phase_pub_;
   rclcpp::TimerBase::SharedPtr                                      control_timer_;
 
   // 센서 데이터 수신용 상호 배제 그룹 (odom, loc, safety, obs 등 데이터 업데이트 전용)
@@ -176,6 +178,20 @@ private:
   void pathCallback(const nav_msgs::msg::Path::SharedPtr msg);
   bool use_global_planner_ = false;  // true: /planned_path 대기, false: 하드코딩 경로
   bool enable_docking_ = true;       // false: 비교 실험에서 목표 도달 시 바로 정지
+
+  // /planned_path 수신 안정화 파라미터임.
+  // planner가 비슷한 경로를 연속 발행해도 MPC가 매번 waypoint를 리셋하지 않도록 막음.
+  double path_accept_min_interval_sec_{0.80};
+  double path_accept_force_interval_sec_{12.00};
+  double path_accept_avg_change_threshold_{0.10};
+  double path_accept_max_change_threshold_{0.30};
+  rclcpp::Time last_path_accept_time_;
+  bool has_accepted_path_{false};
+
+  double computeWaypointPathDifference(
+    const std::vector<StateVec> & new_path,
+    const std::vector<StateVec> & old_path,
+    double & max_dist) const;
 
   // 긴급 정지용 — /cmd_vel_delayed 직접 발행 (mock_link 우회)
   rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr emergency_stop_pub_;
@@ -215,6 +231,7 @@ private:
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_cb_handle_;
   double artificial_load_ms_ = 0.0;
   double v_ref_ = 0.1;
+  std::string odom_topic_ = "/odom";
 
   // W7: 진짜 제어 지연 주입을 위한 큐
   std::deque<geometry_msgs::msg::Twist> delay_queue_;
@@ -231,6 +248,8 @@ private:
 
   // void rerouteWaypointsAroundObstacles();
 
+  bool filter_static_obstacles_in_global_planner_{true};
+
   double prev_raw_theta_    = 0.0;   // 직전 raw atan2 yaw 값 (래핑 delta 계산용)
   double continuous_theta_  = 0.0;   // 누적 연속 yaw (래핑 없는 절대값)
   // ── CBF Safety Filter ──────────────────────────────────────
@@ -242,6 +261,55 @@ private:
   double cbf_slack_p_ = 500.0;  // soft slack 페널티
   double cbf_d_safe_  = 0.0;    // 추가 안전 마진 [m]
   bool   cbf_enabled_ = true;   // CBF 활성화 여부 (런타임 토글용)
+  bool   cbf_fail_stop_enabled_ = true;
+  double cbf_react_dist_ = 1.0;
+  int    cbf_max_active_obstacles_ = 2;
+
+  bool   front_stop_enabled_ = true;
+  double front_slow_distance_ = 0.85;
+  double front_stop_distance_ = 0.25;
+  double front_corridor_half_width_ = 0.45;
+  double front_turn_bias_ = 0.18;
+  double front_min_turn_ = 0.10;
+  double front_predict_time_ = 0.0;
+  double front_avoid_turn_ = 0.45;
+  double front_hold_release_distance_ = 0.65;
+  double front_reverse_enter_distance_ = 0.18;
+  double front_reverse_exit_distance_ = 0.34;
+  double front_reverse_speed_ = 0.06;
+  double front_reverse_duration_ = 0.80;
+  double front_approach_rate_threshold_ = 0.025;
+  double front_avoid_min_forward_speed_ = 0.08;
+  std::string front_avoid_policy_ = "safe";
+  double front_fast_escape_min_clearance_ = 0.08;
+  double front_fast_escape_forward_distance_ = 0.45;
+  double front_fast_escape_lateral_distance_ = 0.20;
+  double front_fast_escape_speed_ = 0.18;
+  double front_fast_escape_turn_ = 0.18;
+  double front_fast_escape_hold_sec_ = 1.20;
+  bool   local_static_front_safety_enabled_ = true;
+  double local_static_front_distance_ = 1.25;
+  double local_static_front_half_width_ = 0.65;
+  double front_clearance_filtered_ = 1e9;
+  bool   front_stop_active_ = false;
+  bool   front_safety_reverse_active_ = false;
+  bool   front_fast_escape_active_ = false;
+  enum class FrontAvoidMode : uint8_t {
+    CLEAR = 0,
+    AVOID_FORWARD = 1,
+    HOLD = 2,
+    REVERSE = 3,
+  };
+  FrontAvoidMode front_avoid_mode_ = FrontAvoidMode::CLEAR;
+  int front_avoid_turn_dir_ = 0;
+  double front_last_clearance_ = 1e9;
+  rclcpp::Time front_reverse_until_;
+  rclcpp::Time front_fast_escape_until_;
+
+  double tracking_min_forward_speed_ = 0.06;
+  double tracking_heading_slow_angle_ = 1.20;
+  double tracking_lateral_slow_error_ = 0.60;
+  double tracking_floor_min_ratio_ = 0.70;
 
   // ──────────────────────────────────────────────────────────
   // 도킹 관련 멤버
@@ -250,26 +318,52 @@ private:
   //     NAVIGATING → A* waypoint 추종 중
   //     DOCKING    → 마지막 waypoint 도달 후 dock 포즈 정밀 정렬
   //     DOCKED     → 완료 판정 통과, 정지 유지
+  //     UNDOCKING  → DOCKED 이후 새 경로 시작 전 제자리 yaw 정렬
+  //     UNDOCKING_RETREAT → station 반대 방향으로 직선 이탈
   //
-  //   dock_x_, dock_y_: NAVIGATING→DOCKING 전환 시
-  //                     waypoints_.back() 위치로 자동 갱신
+  //   dock_x_, dock_y_: NAVIGATING→DOCKING 전환 시 현재 mission의 dock target으로 갱신
   //   dock_yaw_       : 파라미터 "dock_yaw" [rad]으로 외부 설정
   // ──────────────────────────────────────────────────────────
   enum class MissionPhase : uint8_t {
     NAVIGATING = 0,  // A* 경로 추종 중
     DOCKING    = 1,  // dock 포즈 수렴 중
-    DOCKED     = 2   // 도킹 완료, 정지 유지
+    DOCKED     = 2,  // 도킹 완료, 정지 유지
+    UNDOCKING  = 3,  // 복귀 경로 출발 전 제자리 헤딩 정렬
+    UNDOCKING_RETREAT = 4  // station 반대 방향으로 직선 이탈
   };
   MissionPhase mission_phase_ = MissionPhase::NAVIGATING;
 
   // 도킹 목표 포즈 (map frame)
-  double dock_x_   = 0.0;  // 마지막 waypoint x (자동 설정)
-  double dock_y_   = 0.0;  // 마지막 waypoint y (자동 설정)
+  double dock_x_   = 0.0;  // 현재 도킹 목표 x
+  double dock_y_   = 0.0;  // 현재 도킹 목표 y
   double dock_yaw_ = 0.0;  // 도킹 목표 헤딩 [rad] (파라미터)
+  bool fixed_dock_goal_enabled_ = false;
+  double fixed_dock_goal_x_ = 0.0;
+  double fixed_dock_goal_y_ = 0.0;
+  bool active_path_is_return_ = false;
 
   // 도킹 완료 판정 임계값
   double dock_pos_tol_ = 0.0;  // 위치 허용 오차 [m]  (파라미터 "dock_pos_tol")
   double dock_yaw_tol_ = 0.0;  // 헤딩 허용 오차 [rad] (파라미터 "dock_yaw_tol_deg")
+  double docking_enter_radius_ = 0.95;  // goal 근처에서 저속 도킹 제어로 조기 전환할 반경 [m]
+  double dock_pos_release_tol_ = 0.08;  // 헤딩정렬 중 위치 재수렴으로 돌아갈 거리 [m]
+  double dock_yaw_min_w_ = 0.10;        // 헤딩정렬 최소 회전 속도 [rad/s]
+  bool docking_heading_align_started_ = false;
+
+  bool undock_align_enabled_ = true;
+  bool undock_station_away_enabled_ = true;
+  double undock_station_x_ = 3.57683;
+  double undock_station_y_ = -3.32918;
+  double undock_return_goal_x_ = 0.0;
+  double undock_return_goal_y_ = 0.0;
+  double undock_return_goal_tolerance_ = 0.75;
+  double undock_target_yaw_ = 0.0;
+  double undock_yaw_tol_ = 0.052;
+  double undock_yaw_min_w_ = 0.10;
+  double undock_retreat_distance_ = 0.50;
+  double undock_retreat_speed_ = 0.06;
+  double undock_start_x_ = 0.0;
+  double undock_start_y_ = 0.0;
 
   // 도킹 전용 reference 생성
   // N+1개를 모두 dock 포즈로 채워 MPC가 수렴하도록 유도

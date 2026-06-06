@@ -817,6 +817,8 @@ MpcSolution MpcCore::solve(
   sol.success       = false;
   sol.solve_time_ms = 0.0;
   sol.cost          = 0.0;
+  sol.status_val    = 0;
+  sol.setup_exitflag = 0;
   sol.u0.setZero();
 
   if (!is_initialized_) { return sol; }
@@ -879,6 +881,7 @@ MpcSolution MpcCore::solve(
   data.u = u_arr.data();
 
   c_int exitflag = osqp_setup(&work_, &data, settings_);
+  sol.setup_exitflag = static_cast<int>(exitflag);
 
   freeCsc(P_csc);
   freeCsc(A_csc);
@@ -889,6 +892,7 @@ MpcSolution MpcCore::solve(
 
   // QP 풀기
   osqp_solve(work_);
+  sol.status_val = static_cast<int>(work_->info->status_val);
 
   auto t_end = std::chrono::high_resolution_clock::now();
   sol.solve_time_ms =
@@ -898,7 +902,7 @@ MpcSolution MpcCore::solve(
   // OSQP v0.6.3 상태 코드:
   //   1 = OSQP_SOLVED (정상 수렴)
   //   2 = OSQP_SOLVED_INACCURATE (부정확하지만 해 존재)
-  if (work_->info->status_val != 1 && work_->info->status_val != 2) {
+  if (sol.status_val != 1 && sol.status_val != 2) {
     return sol;
   }
 

@@ -1,0 +1,7 @@
+#!/usr/bin/env python3
+
+from manipulation.follow_joint_trajectory_to_joint_state_server import main
+
+
+if __name__ == "__main__":
+    main()

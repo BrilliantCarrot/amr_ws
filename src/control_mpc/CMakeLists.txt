@@ -62,7 +62,6 @@ ament_target_dependencies(obstacle_tracker_node
   rclcpp sensor_msgs amr_msgs tf2 tf2_ros tf2_geometry_msgs
 )
 
-
 ament_target_dependencies(tracking_rmse_node
   rclcpp
   geometry_msgs
@@ -73,10 +72,21 @@ ament_target_dependencies(tracking_rmse_node
   tf2_ros
 )
 
+add_executable(camera_lidar_fusion_node src/camera_lidar_fusion_node.cpp)
+ament_target_dependencies(camera_lidar_fusion_node
+  rclcpp
+  geometry_msgs
+  tf2
+  tf2_ros
+  tf2_geometry_msgs
+  amr_msgs
+)
+
 install(TARGETS
   mpc_node
   tracking_rmse_node
   obstacle_tracker_node
+  camera_lidar_fusion_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

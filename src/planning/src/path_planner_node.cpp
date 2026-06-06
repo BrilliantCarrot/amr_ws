@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 
 namespace planning{
 
@@ -47,22 +48,110 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
   last_plan_time_(this->now())
 {
   // 파라미터 선언 (기본값 포함) — launch 인자로 오버라이드 가능
-  this->declare_parameter("goal_x", 2.0);
+  this->declare_parameter("goal_x", 4.0);
   this->declare_parameter("goal_y", 0.0);
   this->declare_parameter("robot_radius", 0.45);
+  this->declare_parameter("odom_topic", std::string("/map_ekf/odom"));
   this->declare_parameter("replan_period_sec", 3.0);
   this->declare_parameter("replan_obs_dist", 0.5);
   this->declare_parameter("wp_spacing", 0.10);
   this->declare_parameter("goal_tolerance", 0.20);
 
+  // W5 안정화: A*는 정적/전역 경로만 담당하고, 동적 장애물 회피는 MPC-CBF가 담당함.
+  // periodic_replan_enabled=false이면 초기 경로/목표 변경/큰 이탈 상황에서만 전역 경로를 다시 만듦.
+  this->declare_parameter("periodic_replan_enabled", false);
+  this->declare_parameter("off_path_replan_enabled", true);
+  this->declare_parameter("off_path_replan_dist", 0.90);
+  this->declare_parameter("off_path_replan_cooldown_sec", 5.00);
+  this->declare_parameter("planner_replan_on_lidar_obstacles", true);
+
+  // A*가 /obstacles/detected를 반영할지 선택함.
+  // 기본값 all: RViz에서 보이는 LiDAR 장애물이 global path에도 반영되도록 함.
+  // 필요 시 static/dynamic/off로 바꿔 전역 경로 안정성과 장애물 반영 강도를 조절할 수 있음.
+  this->declare_parameter("planner_lidar_astar_mode", std::string("all"));
+  this->declare_parameter("planner_static_speed_threshold", 0.05);
+  this->declare_parameter("map_update_replan_enabled", true);
+  this->declare_parameter("map_update_replan_cooldown_sec", 2.00);
+  this->declare_parameter("map_update_goal_stop_radius", 1.00);
+
+  // 발행/재계획 안정화 파라미터
+  this->declare_parameter("replan_cooldown_sec", 1.20);
+  this->declare_parameter("planner_publish_min_interval_sec", 1.20);
+  this->declare_parameter("planner_publish_force_interval_sec", 4.00);
+  this->declare_parameter("planner_path_avg_change_threshold", 0.12);
+  this->declare_parameter("planner_path_max_change_threshold", 0.35);
+  this->declare_parameter("planner_side_switch_lock_sec", 12.00);
+  this->declare_parameter("planner_side_switch_min_score", 0.20);
+  this->declare_parameter("planner_side_switch_clearance", 0.12);
+  this->declare_parameter("planner_clearance_cost_radius", 0.35);
+  this->declare_parameter("planner_clearance_cost_weight", 8.0);
+  this->declare_parameter("smoothing_los_safety_cells", 2);
+  this->declare_parameter("path_viz_republish_period_sec", 1.0);
+
+  // A*에 반영할 LiDAR 장애물 안전 처리 파라미터임.
+  // 사람 다리처럼 두 개로 나뉘는 장애물이 path planner에서 빈 공간으로 해석되지 않게 하기 위함임.
+  this->declare_parameter("planner_min_obstacle_radius", 0.50);
+  this->declare_parameter("planner_obstacle_margin", 0.10);
+  this->declare_parameter("planner_obstacle_hold_sec", 1.00);
+  this->declare_parameter("planner_use_velocity_filter", false);
+  this->declare_parameter("planner_merge_obstacles", true);
+  this->declare_parameter("planner_obstacle_merge_distance", 0.75);
+  this->declare_parameter("planner_merge_extra_radius", 0.10);
+  this->declare_parameter("planner_max_merged_obstacle_radius", 1.40);
+
+  // Fixed manipulator 피킹 스테이션 docking용 완화 모드.
+  // 일반 주행 safety margin은 유지하고, goal 주변에서만 더 작은 inflation을 사용함.
+  this->declare_parameter("docking_mode", false);
+  this->declare_parameter("docking_relax_radius", 1.00);
+  this->declare_parameter("docking_robot_radius", 0.30);
+  this->declare_parameter("docking_obstacle_margin", 0.03);
+  this->declare_parameter("docking_goal_search_radius", 1.20);
+
   // 선언된 파라미터 값을 멤버 변수에 로드
   goal_x_            = this->get_parameter("goal_x").as_double();
   goal_y_            = this->get_parameter("goal_y").as_double();
+  odom_topic_        = this->get_parameter("odom_topic").as_string();
   robot_radius_      = this->get_parameter("robot_radius").as_double();
   replan_period_sec_ = this->get_parameter("replan_period_sec").as_double();
   replan_obs_dist_   = this->get_parameter("replan_obs_dist").as_double();
   wp_spacing_        = this->get_parameter("wp_spacing").as_double();
   goal_tolerance_    = this->get_parameter("goal_tolerance").as_double();
+  periodic_replan_enabled_ = this->get_parameter("periodic_replan_enabled").as_bool();
+  off_path_replan_enabled_ = this->get_parameter("off_path_replan_enabled").as_bool();
+  off_path_replan_dist_ = this->get_parameter("off_path_replan_dist").as_double();
+  off_path_replan_cooldown_sec_ = this->get_parameter("off_path_replan_cooldown_sec").as_double();
+  planner_replan_on_lidar_obstacles_ = this->get_parameter("planner_replan_on_lidar_obstacles").as_bool();
+  planner_lidar_astar_mode_ = this->get_parameter("planner_lidar_astar_mode").as_string();
+  planner_static_speed_threshold_ = this->get_parameter("planner_static_speed_threshold").as_double();
+  map_update_replan_enabled_ = this->get_parameter("map_update_replan_enabled").as_bool();
+  map_update_replan_cooldown_sec_ = this->get_parameter("map_update_replan_cooldown_sec").as_double();
+  map_update_goal_stop_radius_ = this->get_parameter("map_update_goal_stop_radius").as_double();
+  planner_min_obstacle_radius_ = this->get_parameter("planner_min_obstacle_radius").as_double();
+  planner_obstacle_margin_ = this->get_parameter("planner_obstacle_margin").as_double();
+  planner_obstacle_hold_sec_ = this->get_parameter("planner_obstacle_hold_sec").as_double();
+  planner_use_velocity_filter_ = this->get_parameter("planner_use_velocity_filter").as_bool();
+  planner_merge_obstacles_ = this->get_parameter("planner_merge_obstacles").as_bool();
+  planner_obstacle_merge_distance_ = this->get_parameter("planner_obstacle_merge_distance").as_double();
+  planner_merge_extra_radius_ = this->get_parameter("planner_merge_extra_radius").as_double();
+  planner_max_merged_obstacle_radius_ = this->get_parameter("planner_max_merged_obstacle_radius").as_double();
+  docking_mode_ = this->get_parameter("docking_mode").as_bool();
+  docking_relax_radius_ = this->get_parameter("docking_relax_radius").as_double();
+  docking_robot_radius_ = this->get_parameter("docking_robot_radius").as_double();
+  docking_obstacle_margin_ = this->get_parameter("docking_obstacle_margin").as_double();
+  docking_goal_search_radius_ = this->get_parameter("docking_goal_search_radius").as_double();
+  replan_cooldown_sec_ = this->get_parameter("replan_cooldown_sec").as_double();
+  planner_publish_min_interval_sec_ = this->get_parameter("planner_publish_min_interval_sec").as_double();
+  planner_publish_force_interval_sec_ = this->get_parameter("planner_publish_force_interval_sec").as_double();
+  planner_path_avg_change_threshold_ = this->get_parameter("planner_path_avg_change_threshold").as_double();
+  planner_path_max_change_threshold_ = this->get_parameter("planner_path_max_change_threshold").as_double();
+  planner_side_switch_lock_sec_ = this->get_parameter("planner_side_switch_lock_sec").as_double();
+  planner_side_switch_min_score_ = this->get_parameter("planner_side_switch_min_score").as_double();
+  planner_side_switch_clearance_ = this->get_parameter("planner_side_switch_clearance").as_double();
+  planner_clearance_cost_radius_ = this->get_parameter("planner_clearance_cost_radius").as_double();
+  planner_clearance_cost_weight_ = this->get_parameter("planner_clearance_cost_weight").as_double();
+  smoothing_los_safety_cells_ = this->get_parameter("smoothing_los_safety_cells").as_int();
+  path_viz_republish_period_sec_ =
+    this->get_parameter("path_viz_republish_period_sec").as_double();
 
   // 런치 파라미터로 목표가 이미 주입됐으므로 초기부터 has_goal_ = true
   has_goal_ = true;
@@ -77,10 +166,11 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
     rclcpp::QoS(1).reliable().transient_local(),
     std::bind(&PathPlannerNode::mapCallback, this, std::placeholders::_1));
 
-  // /map_ekf/odom 구독: map_ekf_node가 발행하는 EKF 융합 위치
-  // cur_x_, cur_y_ 갱신에 사용됨
+  // Odometry 구독: cur_x_, cur_y_ 갱신에 사용됨.
+  // Isaac Sim 검증에서는 /odom을 직접 사용해서 MPC와 planner의 pose 기준을 맞춘다.
+  // 기존 LiDAR fusion 기준이 필요하면 odom_topic:=/map_ekf/odom 으로 되돌릴 수 있다.
   odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-    "/map_ekf/odom", qos_reliable,
+    odom_topic_, qos_reliable,
     std::bind(&PathPlannerNode::odomCallback, this, std::placeholders::_1));
 
   // /goal_pose 구독: 외부(RViz2 NavGoal 또는 실험 스크립트)에서 목표 주입
@@ -90,8 +180,10 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
 
   // /obstacles/detected 구독: 동적 장애물 위치/속도/반경 배열
   // obstacle_tracker_node가 LiDAR 클러스터링 결과를 발행
+  // /obstacles/detected는 perception/LiDAR 계열 데이터라 QoS를 너무 강하게 묶지 않음.
+  // RELIABLE/BEST_EFFORT mismatch가 나면 planner가 장애물을 못 받아 A*가 계속 직선 경로를 만들 수 있음.
   obs_sub_ = this->create_subscription<amr_msgs::msg::ObstacleArray>(
-    "/obstacles/detected", qos_reliable,
+    "/obstacles/detected", rclcpp::QoS(10),
     std::bind(&PathPlannerNode::obstacleCallback, this, std::placeholders::_1));
 
   loc_sub_ = this->create_subscription<amr_msgs::msg::LocalizationStatus>(
@@ -105,7 +197,9 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
 
   // /planned_path 발행: 후처리(스무딩+재샘플링)된 경로를 MPC 노드에 전달
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
-    "/planned_path", qos_reliable);
+    "/planned_path", rclcpp::QoS(1).reliable().transient_local());
+  path_viz_pub_ = this->create_publisher<nav_msgs::msg::Path>(
+    "/planned_path_viz", rclcpp::QoS(1).reliable().transient_local());
 
   // 주기 재계획 타이머 설정 (replan_period_sec_ 초마다 실행)
   // double → milliseconds 변환 후 wall_timer 생성
@@ -114,16 +208,54 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
     std::chrono::milliseconds(period_ms),
     std::bind(&PathPlannerNode::replanTimerCallback, this));
 
+  if (path_viz_republish_period_sec_ > 0.0) {
+    int viz_period_ms = static_cast<int>(path_viz_republish_period_sec_ * 1000.0);
+    viz_period_ms = std::max(100, viz_period_ms);
+    path_viz_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(viz_period_ms),
+      std::bind(&PathPlannerNode::pathVizTimerCallback, this));
+  }
+
   RCLCPP_INFO(this->get_logger(),
     "[PathPlanner] 초기화 완료 | goal=(%.2f, %.2f) | "
-    "robot_r=%.2fm | replan=%.1fs | wp_spacing=%.2fm",
-    goal_x_, goal_y_, robot_radius_, replan_period_sec_, wp_spacing_);
+    "robot_r=%.2fm | periodic_replan=%d replan=%.1fs off_path=%d(%.2fm) | "
+    "lidar_astar_mode=%s lidar_replan=%d map_update_replan=%d | docking=%d relax=%.2fm | wp_spacing=%.2fm | "
+    "publish_min=%.1fs force=%.1fs avg_thr=%.2fm max_thr=%.2fm | clearance_cost=%.2fm/%.1f los_safety=%dcell | viz=%.1fs",
+    goal_x_, goal_y_, robot_radius_,
+    periodic_replan_enabled_ ? 1 : 0, replan_period_sec_,
+    off_path_replan_enabled_ ? 1 : 0, off_path_replan_dist_,
+    planner_lidar_astar_mode_.c_str(), planner_replan_on_lidar_obstacles_ ? 1 : 0,
+    map_update_replan_enabled_ ? 1 : 0,
+    docking_mode_ ? 1 : 0, docking_relax_radius_,
+    wp_spacing_, planner_publish_min_interval_sec_, planner_publish_force_interval_sec_,
+    planner_path_avg_change_threshold_, planner_path_max_change_threshold_,
+    planner_clearance_cost_radius_, planner_clearance_cost_weight_, smoothing_los_safety_cells_,
+    path_viz_republish_period_sec_);
 }
 
 void PathPlannerNode::locCallback(
   const amr_msgs::msg::LocalizationStatus::SharedPtr msg)
 {
   loc_status_ = msg->status;
+}
+
+void PathPlannerNode::pathVizTimerCallback()
+{
+  if (!path_viz_pub_ || current_path_.empty()) {
+    return;
+  }
+
+  nav_msgs::msg::Path path_msg;
+  path_msg.header.stamp = this->now();
+  path_msg.header.frame_id = "map";
+  path_msg.poses = current_path_;
+
+  for (auto & pose : path_msg.poses) {
+    pose.header.stamp = path_msg.header.stamp;
+    pose.header.frame_id = "map";
+  }
+
+  path_viz_pub_->publish(path_msg);
 }
 
 // ============================================================
@@ -150,13 +282,35 @@ void PathPlannerNode::mapCallback(
   if (!initial_plan_done_ && has_odom_ && has_goal_) {
     initial_plan_done_ = true;
     plan();
+    return;
+  }
+
+  // SLAM/localization 모드에서 /map이 늦게 갱신되면, 첫 계획 시점에는
+  // 장애물이 아직 맵에 충분히 반영되지 않아 직선 경로가 발행될 수 있음.
+  // 새 맵이 들어오면 쿨다운을 두고 재계획해서 정적 장애물 반영을 보장함.
+  if (map_update_replan_enabled_ && initial_plan_done_ && has_odom_ && has_goal_) {
+    const double dist_to_goal = std::hypot(goal_x_ - cur_x_, goal_y_ - cur_y_);
+    if (dist_to_goal < map_update_goal_stop_radius_) {
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+        "[PathPlanner] 목표 근접 (%.2fm) — map update 재계획 중단, MPC/도킹 마무리 중",
+        dist_to_goal);
+      return;
+    }
+
+    const double elapsed = (this->now() - last_plan_time_).seconds();
+    if (elapsed >= map_update_replan_cooldown_sec_) {
+      RCLCPP_INFO(this->get_logger(),
+        "[PathPlanner] 맵 업데이트 수신 — 정적 장애물 반영 재계획 (elapsed=%.1fs)",
+        elapsed);
+      plan();
+    }
   }
 }
 
 // ============================================================
-// odomCallback() — /map_ekf/odom 수신 콜백
+// odomCallback() — odometry 수신 콜백
 //
-// EKF 융합 위치 추정값을 cur_x_, cur_y_에 업데이트.
+// 선택된 odometry topic의 위치를 cur_x_, cur_y_에 업데이트.
 // 첫 수신 시 has_odom_ 플래그를 세우고 초기 계획 조건 확인.
 // ============================================================
 void PathPlannerNode::odomCallback(
@@ -219,20 +373,30 @@ void PathPlannerNode::goalCallback(
 void PathPlannerNode::obstacleCallback(
   const amr_msgs::msg::ObstacleArray::SharedPtr msg)
 {
-  // 최신 장애물 정보를 저장 (plan()에서 동적 장애물 마킹에 사용)
+  // 최신 LiDAR 장애물 정보를 저장하고 planner hold 버퍼를 갱신함.
+  // planner_lidar_astar_mode가 off가 아니면 plan()에서 이 버퍼를 A* grid에 마킹함.
   latest_obs_ = *msg;
   has_obs_ = true;
+  updateHeldObstacles(*msg);
 
-  // 마지막 계획으로부터 경과 시간 계산
-  double elapsed = (this->now() - last_plan_time_).seconds();
+  RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+    "[PathPlanner] /obstacles/detected 수신 | vector=%zu count_field=%d held=%zu mode=%s replan=%d",
+    msg->x.size(), msg->count, held_obstacles_.size(),
+    planner_lidar_astar_mode_.c_str(), planner_replan_on_lidar_obstacles_ ? 1 : 0);
 
-  // 쿨다운 미충족 → 재계획 억제
+  if (!planner_replan_on_lidar_obstacles_) {
+    return;
+  }
+
+  const double elapsed = (this->now() - last_plan_time_).seconds();
   if (elapsed < replan_cooldown_sec_) return;
 
-  // 현재 경로가 존재하고, 동적 장애물이 경로 근방에 침범했다면 재계획
-  if (!current_path_.empty() && isObstacleNearPath(*msg)) {
+  auto planning_obs = getMergedPlannerObstacles();
+  if (!current_path_.empty() && isObstacleNearPath(planning_obs)) {
     RCLCPP_WARN(this->get_logger(),
-      "[PathPlanner] 동적 장애물 경로 근접 — 재계획 (%.1fs 경과)", elapsed);
+      "[PathPlanner] LiDAR 장애물 경로 근접 — 선택적 전역 재계획 (%.1fs 경과, obs=%zu)",
+      elapsed, planning_obs.size());
+    last_plan_time_ = this->now();
     plan();
   }
 }
@@ -246,7 +410,6 @@ void PathPlannerNode::obstacleCallback(
 // ============================================================
 void PathPlannerNode::replanTimerCallback()
 {
-  // 필수 데이터가 아직 준비 안 됐으면 대기 (3초마다 로그 출력)
   if (!has_map_ || !has_odom_ || !has_goal_) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
       "[PathPlanner] 대기 중 (map=%d, odom=%d, goal=%d)",
@@ -254,20 +417,39 @@ void PathPlannerNode::replanTimerCallback()
     return;
   }
 
-  // 목표와의 거리 계산 (유클리드 직선 거리)
-  double dist_to_goal = std::hypot(goal_x_ - cur_x_, goal_y_ - cur_y_);
-
-  // 목표 1m 이내: 전역 경로 재계획보다 MPC 로컬 제어로 마무리하는 것이 적합
-  // → 재계획 중단
+  const double dist_to_goal = std::hypot(goal_x_ - cur_x_, goal_y_ - cur_y_);
   if (dist_to_goal < 1.0) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
-      "[PathPlanner] 목표 근접 (%.2fm) — 재계획 중단, MPC 마무리 중",
+      "[PathPlanner] 목표 근접 (%.2fm) — 전역 재계획 중단, MPC 마무리 중",
       dist_to_goal);
     return;
   }
 
-  // 조건 만족 → 주기 재계획 실행
-  plan();
+  // 주기 재계획은 기본 비활성.
+  // A*를 계속 현재 위치 기준으로 다시 만들면, MPC reference가 흔들려 stop-and-go가 생김.
+  if (periodic_replan_enabled_) {
+    plan();
+    return;
+  }
+
+  // CBF 회피로 global path에서 크게 벗어난 경우에만 복귀용 전역 재계획을 허용함.
+  // 일반적인 동적 장애물 회피 중에는 기존 A* 경로를 기준선으로 유지함.
+  if (off_path_replan_enabled_ && !current_path_.empty()) {
+    const double path_dist = distanceToCurrentPath(cur_x_, cur_y_);
+    const double elapsed = (this->now() - last_plan_time_).seconds();
+
+    if (path_dist > off_path_replan_dist_ && elapsed > off_path_replan_cooldown_sec_) {
+      RCLCPP_WARN(this->get_logger(),
+        "[PathPlanner] global path 큰 이탈 감지 — 복귀용 재계획 | dist=%.2fm elapsed=%.1fs",
+        path_dist, elapsed);
+      plan();
+      return;
+    }
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+      "[PathPlanner] 기존 global path 유지 | path_dist=%.2fm periodic_replan=OFF",
+      path_dist);
+  }
 }
 
 // ============================================================
@@ -316,6 +498,11 @@ bool PathPlannerNode::plan()
     int gy = static_cast<int>((wy - oy) / res);
     return {gx, gy};
   };
+  auto gridToWorld = [&](int gx, int gy) -> std::pair<double,double> {
+    double wx = gx * res + ox + 0.5 * res;
+    double wy = gy * res + oy + 0.5 * res;
+    return {wx, wy};
+  };
 
   // 목표까지 직선 거리 계산 (goal_tolerance 이내면 이미 도달)
   double dist_to_goal = std::hypot(goal_x_ - cur_x_, goal_y_ - cur_y_);
@@ -348,41 +535,78 @@ bool PathPlannerNode::plan()
   std::vector<int8_t> inflated =
     astar_.inflateMap(map_.data, W, H, inflation_cells);
 
-  // Step 3-1: 동적 장애물을 팽창된 맵 위에 추가 마킹
-  // 정적 장애물은 slam_toolbox 맵에 이미 반영돼 있음.
-  // 동적 장애물(속도 > 0.05 m/s)만 따로 마킹해서 A*가 회피하도록 함.
-  if (has_obs_) {
-    int dynamic_count = 0;
-    for (int i = 0; i < latest_obs_.count; ++i) {
-      // 속도 벡터(vx, vy)의 크기로 동적/정적 구분
-      double speed = std::hypot(latest_obs_.vx[i], latest_obs_.vy[i]);
-      if (speed < 0.05) continue; // 정적 장애물 스킵
+  // Docking mode: fixed Franka station 근처에서는 AMR이 tray를 작업영역에 넣기 위해
+  // 목표점 주변에 한정해 더 작은 robot radius로 계산한 inflation을 사용한다.
+  // 원본 occupied cell은 relaxed grid에서도 유지되므로 실제 장애물을 지우지는 않는다.
+  if (docking_mode_) {
+    int relaxed_inflation_cells =
+      static_cast<int>(std::ceil(std::max(0.0, docking_robot_radius_) / res));
+    std::vector<int8_t> relaxed =
+      astar_.inflateMap(map_.data, W, H, relaxed_inflation_cells);
 
-      // 장애물 중심을 격자 좌표로 변환
-      int obs_gx = static_cast<int>((latest_obs_.x[i] - ox) / res);
-      int obs_gy = static_cast<int>((latest_obs_.y[i] - oy) / res);
-
-      // 팽창 반경 = (장애물 반경 + 로봇 반경) / 해상도
-      // 로봇이 장애물 반경 + 로봇 반경 이상 떨어져야 안전
-      int r_cells = static_cast<int>(
-        std::ceil((latest_obs_.radius[i] + robot_radius_) / res));
-
-      // 원형 마킹 (inflateMap()과 동일한 방식)
-      for (int dy = -r_cells; dy <= r_cells; ++dy) {
-        for (int dx = -r_cells; dx <= r_cells; ++dx) {
-          if (dx * dx + dy * dy > r_cells * r_cells) continue;
-          int nx = obs_gx + dx;
-          int ny = obs_gy + dy;
-          if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
-          inflated[ny * W + nx] = 100;
-        }
+    int relax_cells = static_cast<int>(std::ceil(std::max(0.0, docking_relax_radius_) / res));
+    int copied_cells = 0;
+    for (int dy = -relax_cells; dy <= relax_cells; ++dy) {
+      for (int dx = -relax_cells; dx <= relax_cells; ++dx) {
+        if (dx * dx + dy * dy > relax_cells * relax_cells) continue;
+        int nx = ex + dx;
+        int ny = ey + dy;
+        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+        inflated[ny * W + nx] = relaxed[ny * W + nx];
+        copied_cells++;
       }
-      dynamic_count++;
     }
 
-    if (dynamic_count > 0) {
-      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "[PathPlanner] 동적 장애물 %d개 맵에 마킹", dynamic_count);
+    RCLCPP_INFO(this->get_logger(),
+      "[PathPlanner] docking mode: goal 주변 %.2fm 완화 적용 | robot_r %.2f→%.2f | cells=%d",
+      docking_relax_radius_, robot_radius_, docking_robot_radius_, copied_cells);
+  }
+
+  // Step 3-1: LiDAR 장애물의 A* 반영 여부
+  // 기본값 planner_lidar_astar_mode=all.
+  // RViz에서 보이는 /obstacles/detected가 global path에도 반영되도록 inflated grid에 마킹함.
+  // 동적 장애물 때문에 global path가 흔들리는 실험에서는 launch/param에서 off로 낮출 수 있음.
+  // 선택 모드:
+  //   off     : /obstacles/detected를 A* grid에 반영하지 않음. 경로 안정성 실험용.
+  //   static  : 속도가 작은 LiDAR 장애물만 A* grid에 반영함. 맵에 없는 정적 물체 검증용.
+  //   dynamic : 속도가 큰 LiDAR 장애물만 A* grid에 반영함. 비권장, 실험용.
+  //   all     : 모든 LiDAR 장애물을 A* grid에 반영함. 기본값.
+  if (has_obs_ && planner_lidar_astar_mode_ != "off") {
+    auto planning_obs = getMergedPlannerObstacles();
+    int marked_count = 0;
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "[PathPlanner] planner obstacle buffer | mode=%s latest_vector=%zu count_field=%d held=%zu merged=%zu",
+      planner_lidar_astar_mode_.c_str(), latest_obs_.x.size(), latest_obs_.count,
+      held_obstacles_.size(), planning_obs.size());
+
+    for (const auto & obs : planning_obs) {
+      const double speed = std::hypot(obs.vx, obs.vy);
+
+      if (planner_lidar_astar_mode_ == "static" && speed > planner_static_speed_threshold_) {
+        continue;
+      }
+      if (planner_lidar_astar_mode_ == "dynamic" && speed <= planner_static_speed_threshold_) {
+        continue;
+      }
+
+      const double dist_obs_to_goal = std::hypot(obs.x - goal_x_, obs.y - goal_y_);
+      const bool use_docking_clearance =
+        docking_mode_ && dist_obs_to_goal <= docking_relax_radius_;
+      const double mark_robot_radius =
+        use_docking_clearance ? docking_robot_radius_ : robot_radius_;
+      const double mark_margin =
+        use_docking_clearance ? docking_obstacle_margin_ : planner_obstacle_margin_;
+
+      markPlannerObstacleOnGrid(
+        inflated, W, H, ox, oy, res, obs, mark_robot_radius, mark_margin);
+      marked_count++;
+    }
+
+    if (marked_count > 0) {
+      RCLCPP_INFO(this->get_logger(),
+        "[PathPlanner] LiDAR 장애물 %d개를 A* grid에 선택 반영 | mode=%s",
+        marked_count, planner_lidar_astar_mode_.c_str());
     }
   }
 
@@ -391,18 +615,47 @@ bool PathPlannerNode::plan()
   // inflated[sy*W+sx] > 50 이면 팽창 영역 내부 → A*가 시작점을 막힌 곳으로 인식.
   // 해결: 시작점에서 가장 가까운 자유 셀(≤50)을 BFS 방식으로 탐색해 이동.
   // (팽창 반경을 줄이지 않는 이유: 안전 거리가 줄어들어 벽 충돌 위험)
+  bool start_cell_corrected = false;
   if (inflated[sy * W + sx] > 50) {
     RCLCPP_WARN(this->get_logger(),
       "[PathPlanner] 시작점이 팽창 영역 내부 — 근접 자유 셀로 보정");
+
+    const double goal_dx = goal_x_ - cur_x_;
+    const double goal_dy = goal_y_ - cur_y_;
+    const double goal_norm = std::max(std::hypot(goal_dx, goal_dy), 1e-6);
+    const double ux = goal_dx / goal_norm;
+    const double uy = goal_dy / goal_norm;
+
     bool found = false;
-    // 반경 r=1부터 20까지 점점 확장하며 자유 셀 탐색
-    for (int r = 1; r <= 20 && !found; ++r) {
-      for (int dy = -r; dy <= r && !found; ++dy) {
-        for (int dx = -r; dx <= r && !found; ++dx) {
+    int best_sx = sx;
+    int best_sy = sy;
+    double best_score = std::numeric_limits<double>::infinity();
+
+    // 가까운 자유 셀 중에서도 목표 방향으로 복귀하기 쉬운 셀을 선택한다.
+    for (int r = 1; r <= 20; ++r) {
+      for (int dy = -r; dy <= r; ++dy) {
+        for (int dx = -r; dx <= r; ++dx) {
+          if (std::max(std::abs(dx), std::abs(dy)) != r) continue;
           int nx = sx + dx, ny = sy + dy;
           if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
           if (inflated[ny * W + nx] <= 50) {
-            sx = nx; sy = ny; found = true;
+            auto [wx, wy] = gridToWorld(nx, ny);
+            const double rx = wx - cur_x_;
+            const double ry = wy - cur_y_;
+            const double dist = std::hypot(rx, ry);
+            const double proj = rx * ux + ry * uy;
+            const double lateral = std::abs(-uy * rx + ux * ry);
+            const double score =
+              dist + 0.60 * lateral +
+              0.80 * std::max(0.0, -proj) -
+              0.20 * std::min(std::max(0.0, proj), 0.60);
+
+            if (score < best_score) {
+              best_score = score;
+              best_sx = nx;
+              best_sy = ny;
+              found = true;
+            }
           }
         }
       }
@@ -412,6 +665,14 @@ bool PathPlannerNode::plan()
         "[PathPlanner] 시작점 보정 실패 — 이전 경로 유지");
       return false;
     }
+
+    sx = best_sx;
+    sy = best_sy;
+    start_cell_corrected = true;
+    auto [start_wx, start_wy] = gridToWorld(sx, sy);
+    RCLCPP_INFO(this->get_logger(),
+      "[PathPlanner] 시작점 보정 결과 | corrected=(%.2f, %.2f) current=(%.2f, %.2f)",
+      start_wx, start_wy, cur_x_, cur_y_);
   }
 
   // 목표 셀 보정 (동일한 방식, 탐색 반경 최대 15)
@@ -419,7 +680,10 @@ bool PathPlannerNode::plan()
     RCLCPP_WARN(this->get_logger(),
       "[PathPlanner] 목표점이 팽창 영역 내부 — 근접 자유 셀로 이동");
     bool found = false;
-    for (int r = 1; r <= 15 && !found; ++r) {
+    int goal_search_cells = docking_mode_
+      ? static_cast<int>(std::ceil(std::max(docking_goal_search_radius_, res) / res))
+      : 15;
+    for (int r = 1; r <= goal_search_cells && !found; ++r) {
       for (int dy = -r; dy <= r && !found; ++dy) {
         for (int dx = -r; dx <= r && !found; ++dx) {
           int nx = ex + dx, ny = ey + dy;
@@ -441,9 +705,13 @@ bool PathPlannerNode::plan()
   // 팽창된 맵 위에서 (sx,sy) → (ex,ey) 최단 경로 탐색
   // raw_path: 격자 셀 좌표 시퀀스 [(x,y), ...]
   // 계획 시간도 측정해서 로그에 출력
+  const int clearance_cost_cells =
+    static_cast<int>(std::ceil(std::max(0.0, planner_clearance_cost_radius_) / res));
   auto t0 = std::chrono::high_resolution_clock::now();
   std::vector<std::pair<int,int>> raw_path =
-    astar_.findPath(inflated, W, H, sx, sy, ex, ey);
+    astar_.findPath(
+      inflated, W, H, sx, sy, ex, ey,
+      clearance_cost_cells, planner_clearance_cost_weight_);
   auto t1 = std::chrono::high_resolution_clock::now();
   double plan_ms =
     std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -458,8 +726,8 @@ bool PathPlannerNode::plan()
   }
 
   RCLCPP_INFO(this->get_logger(),
-    "[PathPlanner] A* 완료: raw=%zu pts | 계획시간=%.1fms",
-    raw_path.size(), plan_ms);
+    "[PathPlanner] A* 완료: raw=%zu pts | 계획시간=%.1fms | clearance_cost=%dcells/%.1f",
+    raw_path.size(), plan_ms, clearance_cost_cells, planner_clearance_cost_weight_);
 
   // Step 6: String-Pulling 스무딩
   // A* raw_path는 격자 특성상 계단식 꺾임이 많음.
@@ -497,6 +765,30 @@ bool PathPlannerNode::plan()
     }
   }
 
+  if (start_cell_corrected && !resampled.empty()) {
+    const double dx = resampled.front().pose.position.x - cur_x_;
+    const double dy = resampled.front().pose.position.y - cur_y_;
+    if (std::hypot(dx, dy) > 0.05) {
+      const double yaw = std::atan2(dy, dx);
+      geometry_msgs::msg::PoseStamped cur_pose;
+      cur_pose.header.frame_id = "map";
+      cur_pose.pose.position.x = cur_x_;
+      cur_pose.pose.position.y = cur_y_;
+      cur_pose.pose.orientation.z = std::sin(yaw * 0.5);
+      cur_pose.pose.orientation.w = std::cos(yaw * 0.5);
+      resampled.insert(resampled.begin(), cur_pose);
+    }
+  }
+
+  // Step 9 이전: 경로 발행 hysteresis
+  // A*는 장애물 위치가 조금만 흔들려도 매번 약간 다른 경로를 만들 수 있음.
+  // 이때 /planned_path를 매번 발행하면 MPC가 새 reference를 계속 받아 선속도를 0으로 낮추는 stop-and-go가 생김.
+  // 따라서 기존 경로와 새 경로가 거의 같으면 계산은 성공으로 보되, 발행만 생략함.
+  if (!shouldPublishPath(resampled)) {
+    last_plan_time_ = this->now();  // 재계획 시도도 쿨다운에 반영해서 같은 경로를 과도하게 재계산하지 않음
+    return true;
+  }
+
   // Step 9: /planned_path 발행
   // nav_msgs/Path 메시지로 패킹 후 발행
   // MPC 노드의 /planned_path 구독 콜백이 이 경로를 waypoint로 변환해 사용
@@ -508,6 +800,7 @@ bool PathPlannerNode::plan()
 
   // 발행된 경로를 멤버에 저장 (isObstacleNearPath() 비교용)
   current_path_    = resampled;
+  pathVizTimerCallback();
   // 마지막 계획 시각 갱신 (쿨다운 계산에 사용)
   last_plan_time_  = this->now();
 
@@ -602,11 +895,10 @@ bool PathPlannerNode::hasLineOfSight(
   //   → 직선이 장애물에서 safety 이상 떨어져 있어야만 통과 판정
   //   → 스트링풀링이 코너 근처 직선 생성 불가 → 기존 A* 경로 유지
   //
-  // safety = 2 셀 = 0.10m 추가 안전 마진
-  //   기존 inflation 0.45m + 0.10m = 0.55m 유효 clearance
-  //   로봇 엣지 clearance: 0.55 - 0.20(로봇반경) = 0.35m (기존 0.25m → 개선)
+  // smoothing_los_safety_cells_ 만큼 추가 안전 마진을 둔다.
+  // launch에서 코너 clearance를 키워 string-pulling shortcut을 보수적으로 만들 수 있다.
   // ----------------------------------------------------------------
-  constexpr int safety = 2;
+  const int safety = std::max(0, smoothing_los_safety_cells_);
 
   int dx =  std::abs(x1 - x0);
   int dy =  std::abs(y1 - y0);
@@ -761,55 +1053,424 @@ std::vector<geometry_msgs::msg::PoseStamped> PathPlannerNode::resamplePath(
   return result;
 }
 
+
 // ============================================================
-// isObstacleNearPath() — 동적 장애물 경로 근접 검사
+// distanceToCurrentPath() — 현재 위치가 global path에서 얼마나 벗어났는지 계산
 //
-// [역할]
-//   obstacleCallback()에서 호출되어 이벤트 기반 재계획을 결정함.
-//   현재 발행된 경로(current_path_) 위의 waypoint와
-//   동적 장애물 사이의 거리를 계산해 replan_obs_dist_ 이내면 true 반환.
+// [역할 분리]
+//   CBF가 동적 장애물을 피하면서 일시적으로 A* path를 벗어나는 것은 정상임.
+//   다만 너무 멀리 밀려나서 기존 path 복귀가 어렵다면 그때만 A*를 다시 호출함.
+// ============================================================
+double PathPlannerNode::distanceToCurrentPath(double x, double y) const
+{
+  if (current_path_.empty()) return 1e9;
+
+  double best = 1e9;
+  for (const auto & p : current_path_) {
+    const double dx = p.pose.position.x - x;
+    const double dy = p.pose.position.y - y;
+    best = std::min(best, std::hypot(dx, dy));
+  }
+  return best;
+}
+
+// ============================================================
+// computePathDifference() — 새 경로와 기존 경로의 기하학적 차이 계산
 //
-// [최적화]
-//   경로의 모든 waypoint를 검사하면 느림 → 5개 간격으로 샘플링 (pi += 5)
-//   정확도보다 반응 속도를 우선하는 설계
+// [목적]
+//   같은 복도/같은 우회 방향의 경로인데 시작점만 조금 전진한 경우에는
+//   /planned_path를 다시 발행할 필요가 없음.
+//   새 경로의 여러 점이 기존 경로와 얼마나 떨어져 있는지 평균/최대 거리로 판단함.
+// ============================================================
+double PathPlannerNode::computePathDifference(
+  const std::vector<geometry_msgs::msg::PoseStamped> & new_path,
+  const std::vector<geometry_msgs::msg::PoseStamped> & old_path,
+  double & max_dist) const
+{
+  max_dist = 0.0;
+  if (new_path.empty() || old_path.empty()) {
+    max_dist = 1e9;
+    return 1e9;
+  }
+
+  double sum = 0.0;
+  int count = 0;
+
+  // 너무 촘촘하게 비교하면 계산량만 늘고 의미가 작음.
+  // 5개 간격으로 샘플링하면 wp_spacing=0.1m 기준 약 0.5m 간격 비교임.
+  for (size_t i = 0; i < new_path.size(); i += 5) {
+    const double nx = new_path[i].pose.position.x;
+    const double ny = new_path[i].pose.position.y;
+
+    double best = 1e9;
+    for (size_t j = 0; j < old_path.size(); j += 5) {
+      const double ox = old_path[j].pose.position.x;
+      const double oy = old_path[j].pose.position.y;
+      best = std::min(best, std::hypot(nx - ox, ny - oy));
+    }
+
+    sum += best;
+    max_dist = std::max(max_dist, best);
+    ++count;
+  }
+
+  return (count > 0) ? (sum / static_cast<double>(count)) : 1e9;
+}
+
+// ============================================================
+// shouldPublishPath() — /planned_path 발행 여부 결정
 //
-// [clearance 계산]
-//   dist = 장애물 중심 → 경로점 거리
-//   clearance = dist - 장애물 반경
-//   (장애물 반경을 빼야 로봇 몸체 기준 실제 여유 공간이 됨)
+// [핵심]
+//   A* 계산 성공과 /planned_path 발행은 분리함.
+//   - 새 경로가 기존 경로와 거의 같으면 발행 생략
+//   - 일정 시간 이상 지나면 force publish 허용
+//   - 경로가 크게 달라졌으면 즉시 발행 허용
+//
+// [효과]
+//   MPC가 비슷한 path를 계속 새 path로 받아 reference를 리셋하는 현상을 줄임.
+// ============================================================
+bool PathPlannerNode::shouldPublishPath(
+  const std::vector<geometry_msgs::msg::PoseStamped> & new_path) const
+{
+  if (current_path_.empty()) return true;
+
+  double max_diff = 0.0;
+  const double avg_diff = computePathDifference(new_path, current_path_, max_diff);
+  const double elapsed = (this->now() - last_plan_time_).seconds();
+
+  auto sideScore = [&](const std::vector<geometry_msgs::msg::PoseStamped> & path) {
+    const double dx_goal = goal_x_ - cur_x_;
+    const double dy_goal = goal_y_ - cur_y_;
+    const double norm = std::hypot(dx_goal, dy_goal);
+    if (norm < 1e-6 || path.empty()) return 0.0;
+
+    const double ux = dx_goal / norm;
+    const double uy = dy_goal / norm;
+    double sum = 0.0;
+    int count = 0;
+
+    for (const auto & p : path) {
+      const double px = p.pose.position.x - cur_x_;
+      const double py = p.pose.position.y - cur_y_;
+      const double forward = px * ux + py * uy;
+      if (forward < 0.15) continue;
+      if (forward > 2.00) break;
+
+      const double lateral = ux * py - uy * px;
+      sum += lateral;
+      ++count;
+    }
+
+    return count > 0 ? sum / static_cast<double>(count) : 0.0;
+  };
+
+  auto currentPathMinClearance = [&]() {
+    const auto planning_obs = getMergedPlannerObstacles();
+    if (planning_obs.empty() || current_path_.empty()) return 1e9;
+
+    double best_clearance = 1e9;
+    for (size_t pi = 0; pi < current_path_.size(); pi += 3) {
+      const double px = current_path_[pi].pose.position.x;
+      const double py = current_path_[pi].pose.position.y;
+
+      for (const auto & o : planning_obs) {
+        const double dist = std::hypot(o.x - px, o.y - py);
+        const double clearance =
+          dist - std::max(o.radius, planner_min_obstacle_radius_) - planner_obstacle_margin_;
+        best_clearance = std::min(best_clearance, clearance);
+      }
+    }
+
+    return best_clearance;
+  };
+
+  const double old_side = sideScore(current_path_);
+  const double new_side = sideScore(new_path);
+  const bool side_switch =
+    std::abs(old_side) > planner_side_switch_min_score_ &&
+    std::abs(new_side) > planner_side_switch_min_score_ &&
+    old_side * new_side < 0.0;
+
+  if (side_switch && elapsed < planner_side_switch_lock_sec_) {
+    const double min_clearance = currentPathMinClearance();
+    if (min_clearance > planner_side_switch_clearance_) {
+      RCLCPP_WARN(this->get_logger(),
+        "[PathPlanner] 좌/우 우회 방향 전환 보류 | old_side=%.2f new_side=%.2f "
+        "clear=%.2fm avg=%.3fm max=%.3fm elapsed=%.2fs",
+        old_side, new_side, min_clearance, avg_diff, max_diff, elapsed);
+      return false;
+    }
+
+    RCLCPP_WARN(this->get_logger(),
+      "[PathPlanner] 기존 경로 근접 장애물로 우회 방향 전환 허용 | "
+      "old_side=%.2f new_side=%.2f clear=%.2fm elapsed=%.2fs",
+      old_side, new_side, min_clearance, elapsed);
+  }
+
+  // 경로가 크게 달라졌으면 최소 발행 간격 안이라도 허용함.
+  // 예: 장애물이 실제로 경로를 막아서 좌측 우회 → 우측 우회로 바뀌는 상황.
+  const bool clearly_different =
+    (avg_diff > planner_path_avg_change_threshold_ * 2.0) ||
+    (max_diff > planner_path_max_change_threshold_ * 1.5);
+  if (clearly_different) {
+    RCLCPP_INFO(this->get_logger(),
+      "[PathPlanner] 새 경로 차이 큼 — 발행 허용 | avg=%.3fm max=%.3fm elapsed=%.2fs",
+      avg_diff, max_diff, elapsed);
+    return true;
+  }
+
+  // 너무 짧은 간격으로 거의 같은 경로를 보내면 MPC가 계속 리셋됨.
+  if (elapsed < planner_publish_min_interval_sec_) {
+    RCLCPP_INFO(this->get_logger(),
+      "[PathPlanner] 유사 경로 발행 생략(최소간격) | avg=%.3fm max=%.3fm elapsed=%.2fs",
+      avg_diff, max_diff, elapsed);
+    return false;
+  }
+
+  // 강제 발행 시간이 지나기 전까지는 거의 같은 경로를 계속 누르지 않음.
+  const bool almost_same =
+    (avg_diff < planner_path_avg_change_threshold_) &&
+    (max_diff < planner_path_max_change_threshold_);
+  if (almost_same && elapsed < planner_publish_force_interval_sec_) {
+    RCLCPP_INFO(this->get_logger(),
+      "[PathPlanner] 유사 경로 발행 생략 | avg=%.3fm max=%.3fm elapsed=%.2fs",
+      avg_diff, max_diff, elapsed);
+    return false;
+  }
+
+  RCLCPP_INFO(this->get_logger(),
+    "[PathPlanner] 경로 발행 필요 | avg=%.3fm max=%.3fm elapsed=%.2fs",
+    avg_diff, max_diff, elapsed);
+  return true;
+}
+
+// ============================================================
+// updateHeldObstacles() — planner 내부 장애물 hold 버퍼 갱신
+//
+// [목적]
+//   /obstacles/detected가 한 프레임 튀거나 사라져도 A* grid에서 바로 지우지 않음.
+//   사람이 다리 두 개로 보이거나 동적 cylinder가 움직일 때 경로가 갑자기 직진으로 튀는 문제를 줄임.
+// ============================================================
+void PathPlannerNode::updateHeldObstacles(
+  const amr_msgs::msg::ObstacleArray & obs)
+{
+  // planner hold 버퍼의 last_seen은 메시지 header stamp가 아니라
+  // planner 노드가 실제로 수신한 시각(this->now())을 사용함.
+  // 이유: Isaac Sim/ROS time 설정에 따라 /obstacles/detected header.stamp와
+  //       path_planner_node의 now() 기준이 어긋나면,
+  //       방금 받은 장애물도 오래된 장애물로 판단되어 즉시 삭제될 수 있음.
+  const rclcpp::Time stamp = this->now();
+
+  std::vector<bool> matched(held_obstacles_.size(), false);
+
+  // 중요: ObstacleArray의 count 필드가 0이거나 늦게 갱신되어도
+  // x/y/radius vector에는 실제 장애물이 들어오는 경우가 있음.
+  // 그래서 planner에서는 count 필드보다 vector 길이를 기준으로 장애물을 처리함.
+  const int n = std::min({
+    static_cast<int>(obs.x.size()),
+    static_cast<int>(obs.y.size()),
+    static_cast<int>(obs.radius.size())
+  });
+
+  for (int i = 0; i < n; ++i) {
+    PlannerObstacle cur;
+    cur.x = obs.x[i];
+    cur.y = obs.y[i];
+    cur.vx = (i < static_cast<int>(obs.vx.size())) ? obs.vx[i] : 0.0;
+    cur.vy = (i < static_cast<int>(obs.vy.size())) ? obs.vy[i] : 0.0;
+    cur.radius = std::max(obs.radius[i], planner_min_obstacle_radius_);
+    cur.last_seen = stamp;
+
+    int best_idx = -1;
+    double best_dist = planner_obstacle_merge_distance_;
+    for (size_t j = 0; j < held_obstacles_.size(); ++j) {
+      if (matched[j]) continue;
+      double d = std::hypot(cur.x - held_obstacles_[j].x, cur.y - held_obstacles_[j].y);
+      if (d < best_dist) {
+        best_dist = d;
+        best_idx = static_cast<int>(j);
+      }
+    }
+
+    if (best_idx >= 0) {
+      auto & prev = held_obstacles_[static_cast<size_t>(best_idx)];
+      matched[static_cast<size_t>(best_idx)] = true;
+
+      // planner용 버퍼는 tracker보다 빠르게 따라가도 되므로 alpha를 크게 둠.
+      constexpr double alpha = 0.45;
+      prev.x = (1.0 - alpha) * prev.x + alpha * cur.x;
+      prev.y = (1.0 - alpha) * prev.y + alpha * cur.y;
+      prev.vx = (1.0 - alpha) * prev.vx + alpha * cur.vx;
+      prev.vy = (1.0 - alpha) * prev.vy + alpha * cur.vy;
+      prev.radius = std::max((1.0 - alpha) * prev.radius + alpha * cur.radius,
+                             planner_min_obstacle_radius_);
+      prev.last_seen = stamp;
+    } else {
+      held_obstacles_.push_back(cur);
+      matched.push_back(true);
+    }
+  }
+
+  // 일정 시간 이상 새로 보이지 않은 장애물은 제거함.
+  auto now = this->now();
+  held_obstacles_.erase(
+    std::remove_if(
+      held_obstacles_.begin(), held_obstacles_.end(),
+      [&](const PlannerObstacle & o) {
+        return (now - o.last_seen).seconds() > planner_obstacle_hold_sec_;
+      }),
+    held_obstacles_.end());
+}
+
+// ============================================================
+// getMergedPlannerObstacles() — 가까운 planner 장애물 병합
+//
+// [목적]
+//   tracker에서 병합했더라도 planner에서 한 번 더 병합함.
+//   사람 다리 두 개, 움직이는 cylinder와 주변 scan 조각 등이 가까우면 하나의 큰 안전 영역으로 취급함.
+// ============================================================
+std::vector<PlannerObstacle> PathPlannerNode::getMergedPlannerObstacles() const
+{
+  if (!planner_merge_obstacles_ || held_obstacles_.empty()) {
+    return held_obstacles_;
+  }
+
+  std::vector<PlannerObstacle> result;
+  std::vector<bool> used(held_obstacles_.size(), false);
+
+  for (size_t i = 0; i < held_obstacles_.size(); ++i) {
+    if (used[i]) continue;
+
+    std::vector<size_t> group;
+    std::vector<size_t> queue;
+    used[i] = true;
+    queue.push_back(i);
+
+    while (!queue.empty()) {
+      size_t idx = queue.back();
+      queue.pop_back();
+      group.push_back(idx);
+
+      for (size_t j = 0; j < held_obstacles_.size(); ++j) {
+        if (used[j]) continue;
+        double d = std::hypot(
+          held_obstacles_[idx].x - held_obstacles_[j].x,
+          held_obstacles_[idx].y - held_obstacles_[j].y);
+        if (d <= planner_obstacle_merge_distance_) {
+          used[j] = true;
+          queue.push_back(j);
+        }
+      }
+    }
+
+    if (group.size() == 1) {
+      PlannerObstacle single = held_obstacles_[group.front()];
+      single.radius = std::max(single.radius, planner_min_obstacle_radius_);
+      result.push_back(single);
+      continue;
+    }
+
+    double sum_w = 0.0;
+    double mx = 0.0, my = 0.0;
+    double mvx = 0.0, mvy = 0.0;
+    rclcpp::Time latest = held_obstacles_[group.front()].last_seen;
+
+    for (size_t idx : group) {
+      const auto & o = held_obstacles_[idx];
+      double w = std::max(o.radius, 0.05);
+      sum_w += w;
+      mx += w * o.x;
+      my += w * o.y;
+      mvx += o.vx;
+      mvy += o.vy;
+      if (o.last_seen > latest) latest = o.last_seen;
+    }
+
+    mx /= std::max(sum_w, 1e-6);
+    my /= std::max(sum_w, 1e-6);
+    mvx /= static_cast<double>(group.size());
+    mvy /= static_cast<double>(group.size());
+
+    double mr = planner_min_obstacle_radius_;
+    for (size_t idx : group) {
+      const auto & o = held_obstacles_[idx];
+      double cover_r = std::hypot(o.x - mx, o.y - my) + std::max(o.radius, planner_min_obstacle_radius_);
+      mr = std::max(mr, cover_r);
+    }
+    mr = std::min(mr + planner_merge_extra_radius_, planner_max_merged_obstacle_radius_);
+
+    PlannerObstacle merged;
+    merged.x = mx;
+    merged.y = my;
+    merged.vx = mvx;
+    merged.vy = mvy;
+    merged.radius = mr;
+    merged.last_seen = latest;
+    result.push_back(merged);
+  }
+
+  return result;
+}
+
+// ============================================================
+// markPlannerObstacleOnGrid() — planner 장애물을 A* grid에 원형 마킹
+// ============================================================
+void PathPlannerNode::markPlannerObstacleOnGrid(
+  std::vector<int8_t> & grid, int w, int h,
+  double origin_x, double origin_y, double resolution,
+  const PlannerObstacle & obs,
+  double robot_radius_for_mark,
+  double obstacle_margin_for_mark) const
+{
+  int obs_gx = static_cast<int>((obs.x - origin_x) / resolution);
+  int obs_gy = static_cast<int>((obs.y - origin_y) / resolution);
+
+  // 로봇 외접 반경 + 장애물 반경 + planner 여유 마진을 모두 반영함.
+  double effective_radius =
+    std::max(obs.radius, planner_min_obstacle_radius_) +
+    std::max(0.0, robot_radius_for_mark) +
+    std::max(0.0, obstacle_margin_for_mark);
+  int r_cells = static_cast<int>(std::ceil(effective_radius / resolution));
+
+  for (int dy = -r_cells; dy <= r_cells; ++dy) {
+    for (int dx = -r_cells; dx <= r_cells; ++dx) {
+      if (dx * dx + dy * dy > r_cells * r_cells) continue;
+      int nx = obs_gx + dx;
+      int ny = obs_gy + dy;
+      if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+      grid[ny * w + nx] = 100;
+    }
+  }
+}
+
+// ============================================================
+// isObstacleNearPath() — 장애물 경로 근접 검사
 // ============================================================
 bool PathPlannerNode::isObstacleNearPath(
-  const amr_msgs::msg::ObstacleArray & obs) const
+  const std::vector<PlannerObstacle> & obs) const
 {
-  // 경로 없거나 장애물 없으면 검사 불필요
-  if (current_path_.empty() || obs.count == 0) return false;
+  if (current_path_.empty() || obs.empty()) return false;
 
-  // 경로 waypoint를 5개 간격으로 샘플링 (연산량 절감)
-  // current_path_에 예를 들어 100개의 waypoint가 있다면, 0, 5, 10, 15 ... 번째 waypoint만 검사한다는 뜻
   for (size_t pi = 0; pi < current_path_.size(); pi += 5) {
     double px = current_path_[pi].pose.position.x;
     double py = current_path_[pi].pose.position.y;
 
-    // 모든 동적 장애물에 대해 검사
-    for (int oi = 0; oi < obs.count; ++oi) {
-      // 정적 장애물(속도 < 0.05 m/s)은 맵에 이미 반영됨 → 스킵
-      double speed = std::hypot(obs.vx[oi], obs.vy[oi]);
-      if (speed < 0.05) continue;
+    for (const auto & o : obs) {
+      if (planner_use_velocity_filter_) {
+        double speed = std::hypot(o.vx, o.vy);
+        if (speed < 0.05) continue;
+      }
 
-      // 장애물 중심 → 경로점 거리
-      double dist = std::hypot(obs.x[oi] - px, obs.y[oi] - py);
-      // 실제 여유 공간 = 거리 - 장애물 반경
-      // 중심 간 거리(dist)만 쓰면 장애물이 클수록 손해라서, 반경을 빼서 실제 표면 기준 여유 공간으로 판단
-      double clearance = dist - obs.radius[oi];
+      double dist = std::hypot(o.x - px, o.y - py);
+      double clearance = dist - std::max(o.radius, planner_min_obstacle_radius_) - planner_obstacle_margin_;
 
-      // 여유 공간이 임계값 이하면 재계획 필요
       if (clearance < replan_obs_dist_) {
         return true;
       }
     }
   }
 
-  return false; // 모든 검사 통과 → 재계획 불필요
+  return false;
 }
 
 } // namespace planning

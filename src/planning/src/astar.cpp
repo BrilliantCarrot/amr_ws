@@ -4,6 +4,7 @@
 #include <cmath>
 #include <limits>
 #include <queue>
+#include <tuple>
 #include <vector>
 
 namespace planning{
@@ -128,7 +129,9 @@ std::vector<std::pair<int,int>> AStar::findPath(
   const std::vector<int8_t> & grid,
   int W, int H,
   int sx, int sy,
-  int gx, int gy) const
+  int gx, int gy,
+  int clearance_cost_cells,
+  double clearance_cost_weight) const
 {
   // --- 유효성 검사용 람다 ---
 
@@ -158,6 +161,43 @@ std::vector<std::pair<int,int>> AStar::findPath(
   const int DX[8] = { 1,  0, -1,  0,  1,  1, -1, -1};
   const int DY[8] = { 0,  1,  0, -1,  1, -1,  1, -1};
   const double COST[8] = {1.0, 1.0, 1.0, 1.0, 1.4142, 1.4142, 1.4142, 1.4142};
+
+  const int clearance_cells = std::max(0, clearance_cost_cells);
+  const double clearance_weight = std::max(0.0, clearance_cost_weight);
+  std::vector<double> clearance_penalty(W * H, 0.0);
+
+  if (clearance_cells > 0 && clearance_weight > 0.0) {
+    const int r2 = clearance_cells * clearance_cells;
+    for (int y = 0; y < H; ++y) {
+      for (int x = 0; x < W; ++x) {
+        if (isBlocked(x, y)) continue;
+
+        int best_d2 = r2 + 1;
+        for (int dy = -clearance_cells; dy <= clearance_cells; ++dy) {
+          for (int dx = -clearance_cells; dx <= clearance_cells; ++dx) {
+            const int d2 = dx * dx + dy * dy;
+            if (d2 > r2 || d2 >= best_d2) continue;
+
+            const int nx = x + dx;
+            const int ny = y + dy;
+            if (!inBounds(nx, ny)) {
+              best_d2 = d2;
+              continue;
+            }
+            if (isBlocked(nx, ny)) {
+              best_d2 = d2;
+            }
+          }
+        }
+
+        if (best_d2 <= r2) {
+          const double d = std::sqrt(static_cast<double>(best_d2));
+          const double t = 1.0 - std::clamp(d / std::max(1.0, static_cast<double>(clearance_cells)), 0.0, 1.0);
+          clearance_penalty[y * W + x] = clearance_weight * t * t;
+        }
+      }
+    }
+  }
 
   // --- 배열 초기화 ---
   const double INF = std::numeric_limits<double>::infinity();
@@ -244,7 +284,9 @@ std::vector<std::pair<int,int>> AStar::findPath(
 
       // 현재 셀(cx,cy)을 거쳐 이웃 셀(nx,ny)까지 오는 새 g값 계산
       // ng = 현재까지의 g값 + 이동 비용(직선 1.0 or 대각선 1.4142)
-      double ng = cg + COST[i];
+      const double cell_penalty = 0.5 * (
+        clearance_penalty[cy * W + cx] + clearance_penalty[ny * W + nx]);
+      double ng = cg + COST[i] * (1.0 + cell_penalty);
 
       // 이 경로가 기존에 기록된 g_cost보다 더 좋으면(비용이 작으면) 갱신
       if (ng < g_cost[ny * W + nx]) {
