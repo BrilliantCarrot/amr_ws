@@ -17,6 +17,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 # ---------------------------------------------------------------
 add_executable(path_planner_node
   src/astar.cpp
+  src/rrt_star.cpp
   src/path_planner_node.cpp
   src/main.cpp
 )

@@ -45,7 +45,8 @@ namespace planning{
 // ============================================================
 PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
 : Node("path_planner_node", options),
-  last_plan_time_(this->now())
+  last_plan_time_(this->now()),
+  last_replan_attempt_time_(this->now())
 {
   // 파라미터 선언 (기본값 포함) — launch 인자로 오버라이드 가능
   this->declare_parameter("goal_x", 4.0);
@@ -87,6 +88,17 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("planner_clearance_cost_weight", 8.0);
   this->declare_parameter("smoothing_los_safety_cells", 2);
   this->declare_parameter("path_viz_republish_period_sec", 1.0);
+
+  // Planner backend 선택.
+  // astar: 기존 grid 기반 A*, rrt_star: sampling-based RRT*.
+  this->declare_parameter("planner_type", std::string("astar"));
+  this->declare_parameter("rrt_max_iterations", 3000);
+  this->declare_parameter("rrt_step_size", 0.25);
+  this->declare_parameter("rrt_goal_sample_rate", 0.10);
+  this->declare_parameter("rrt_goal_tolerance", 0.25);
+  this->declare_parameter("rrt_rewire_radius", 0.60);
+  this->declare_parameter("rrt_collision_check_resolution", 0.05);
+  this->declare_parameter("rrt_random_seed", 7);
 
   // A*에 반영할 LiDAR 장애물 안전 처리 파라미터임.
   // 사람 다리처럼 두 개로 나뉘는 장애물이 path planner에서 빈 공간으로 해석되지 않게 하기 위함임.
@@ -152,6 +164,15 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
   smoothing_los_safety_cells_ = this->get_parameter("smoothing_los_safety_cells").as_int();
   path_viz_republish_period_sec_ =
     this->get_parameter("path_viz_republish_period_sec").as_double();
+  planner_type_ = this->get_parameter("planner_type").as_string();
+  rrt_max_iterations_ = this->get_parameter("rrt_max_iterations").as_int();
+  rrt_step_size_ = this->get_parameter("rrt_step_size").as_double();
+  rrt_goal_sample_rate_ = this->get_parameter("rrt_goal_sample_rate").as_double();
+  rrt_goal_tolerance_ = this->get_parameter("rrt_goal_tolerance").as_double();
+  rrt_rewire_radius_ = this->get_parameter("rrt_rewire_radius").as_double();
+  rrt_collision_check_resolution_ =
+    this->get_parameter("rrt_collision_check_resolution").as_double();
+  rrt_random_seed_ = this->get_parameter("rrt_random_seed").as_int();
 
   // 런치 파라미터로 목표가 이미 주입됐으므로 초기부터 has_goal_ = true
   has_goal_ = true;
@@ -190,11 +211,6 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
     "/localization/status", qos_reliable,
     std::bind(&PathPlannerNode::locCallback, this, std::placeholders::_1));
 
-
-
-
-
-
   // /planned_path 발행: 후처리(스무딩+재샘플링)된 경로를 MPC 노드에 전달
   path_pub_ = this->create_publisher<nav_msgs::msg::Path>(
     "/planned_path", rclcpp::QoS(1).reliable().transient_local());
@@ -220,7 +236,8 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
     "[PathPlanner] 초기화 완료 | goal=(%.2f, %.2f) | "
     "robot_r=%.2fm | periodic_replan=%d replan=%.1fs off_path=%d(%.2fm) | "
     "lidar_astar_mode=%s lidar_replan=%d map_update_replan=%d | docking=%d relax=%.2fm | wp_spacing=%.2fm | "
-    "publish_min=%.1fs force=%.1fs avg_thr=%.2fm max_thr=%.2fm | clearance_cost=%.2fm/%.1f los_safety=%dcell | viz=%.1fs",
+    "publish_min=%.1fs force=%.1fs avg_thr=%.2fm max_thr=%.2fm | clearance_cost=%.2fm/%.1f los_safety=%dcell | "
+    "planner=%s rrt_iter=%d step=%.2fm rewire=%.2fm | viz=%.1fs",
     goal_x_, goal_y_, robot_radius_,
     periodic_replan_enabled_ ? 1 : 0, replan_period_sec_,
     off_path_replan_enabled_ ? 1 : 0, off_path_replan_dist_,
@@ -230,6 +247,7 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
     wp_spacing_, planner_publish_min_interval_sec_, planner_publish_force_interval_sec_,
     planner_path_avg_change_threshold_, planner_path_max_change_threshold_,
     planner_clearance_cost_radius_, planner_clearance_cost_weight_, smoothing_los_safety_cells_,
+    planner_type_.c_str(), rrt_max_iterations_, rrt_step_size_, rrt_rewire_radius_,
     path_viz_republish_period_sec_);
 }
 
@@ -388,7 +406,15 @@ void PathPlannerNode::obstacleCallback(
     return;
   }
 
-  const double elapsed = (this->now() - last_plan_time_).seconds();
+  const double dist_to_goal = std::hypot(goal_x_ - cur_x_, goal_y_ - cur_y_);
+  if (dist_to_goal < 1.0) {
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+      "[PathPlanner] 목표 근접 (%.2fm) — 장애물 트리거 전역 재계획 중단",
+      dist_to_goal);
+    return;
+  }
+
+  const double elapsed = (this->now() - last_replan_attempt_time_).seconds();
   if (elapsed < replan_cooldown_sec_) return;
 
   auto planning_obs = getMergedPlannerObstacles();
@@ -396,7 +422,7 @@ void PathPlannerNode::obstacleCallback(
     RCLCPP_WARN(this->get_logger(),
       "[PathPlanner] LiDAR 장애물 경로 근접 — 선택적 전역 재계획 (%.1fs 경과, obs=%zu)",
       elapsed, planning_obs.size());
-    last_plan_time_ = this->now();
+    last_replan_attempt_time_ = this->now();
     plan();
   }
 }
@@ -605,7 +631,7 @@ bool PathPlannerNode::plan()
 
     if (marked_count > 0) {
       RCLCPP_INFO(this->get_logger(),
-        "[PathPlanner] LiDAR 장애물 %d개를 A* grid에 선택 반영 | mode=%s",
+        "[PathPlanner] LiDAR 장애물 %d개를 planner grid에 선택 반영 | mode=%s",
         marked_count, planner_lidar_astar_mode_.c_str());
     }
   }
@@ -701,36 +727,70 @@ bool PathPlannerNode::plan()
     }
   }
 
-  // Step 5: A* 경로 탐색
-  // 팽창된 맵 위에서 (sx,sy) → (ex,ey) 최단 경로 탐색
-  // raw_path: 격자 셀 좌표 시퀀스 [(x,y), ...]
-  // 계획 시간도 측정해서 로그에 출력
+  // Step 5: planner backend 경로 탐색
+  // 팽창된 맵 위에서 (sx,sy) → (ex,ey) 경로를 찾고,
+  // 이후 smoothing/resampling/publish hysteresis는 A*와 RRT*가 공통으로 사용한다.
   const int clearance_cost_cells =
     static_cast<int>(std::ceil(std::max(0.0, planner_clearance_cost_radius_) / res));
   auto t0 = std::chrono::high_resolution_clock::now();
-  std::vector<std::pair<int,int>> raw_path =
-    astar_.findPath(
+  std::vector<std::pair<int,int>> raw_path;
+  std::string used_planner = planner_type_;
+
+  if (planner_type_ == "rrt_star" || planner_type_ == "rrt*" || planner_type_ == "rrtstar") {
+    RRTStarParams rrt_params;
+    rrt_params.max_iterations = rrt_max_iterations_;
+    rrt_params.step_size_cells =
+      std::max(rrt_step_size_, res) / std::max(res, 1e-6);
+    rrt_params.goal_sample_rate = rrt_goal_sample_rate_;
+    rrt_params.goal_tolerance_cells =
+      std::max(rrt_goal_tolerance_, res) / std::max(res, 1e-6);
+    rrt_params.rewire_radius_cells =
+      std::max(rrt_rewire_radius_, rrt_step_size_) / std::max(res, 1e-6);
+    rrt_params.collision_check_step_cells =
+      std::max(rrt_collision_check_resolution_, res) / std::max(res, 1e-6);
+    rrt_params.random_seed = static_cast<unsigned int>(std::max(0, rrt_random_seed_));
+
+    raw_path = rrt_star_.findPath(
+      inflated, W, H, sx, sy, ex, ey, rrt_params);
+    used_planner = "rrt_star";
+  } else {
+    if (planner_type_ != "astar") {
+      RCLCPP_WARN(this->get_logger(),
+        "[PathPlanner] 알 수 없는 planner_type='%s' — astar로 fallback",
+        planner_type_.c_str());
+      used_planner = "astar";
+    }
+    raw_path = astar_.findPath(
       inflated, W, H, sx, sy, ex, ey,
       clearance_cost_cells, planner_clearance_cost_weight_);
+  }
   auto t1 = std::chrono::high_resolution_clock::now();
   double plan_ms =
     std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-  // A*가 경로를 찾지 못한 경우 (목표 고립, 완전 막힘 등)
+  // Planner가 경로를 찾지 못한 경우 (목표 고립, 완전 막힘 등)
   if (raw_path.empty()) {
     RCLCPP_WARN(this->get_logger(),
-      "[PathPlanner] A* 경로 탐색 실패 "
+      "[PathPlanner] %s 경로 탐색 실패 "
       "(start=(%d,%d) goal=(%d,%d)) — 이전 경로 유지",
-      sx, sy, ex, ey);
+      used_planner.c_str(), sx, sy, ex, ey);
     return false;
   }
 
-  RCLCPP_INFO(this->get_logger(),
-    "[PathPlanner] A* 완료: raw=%zu pts | 계획시간=%.1fms | clearance_cost=%dcells/%.1f",
-    raw_path.size(), plan_ms, clearance_cost_cells, planner_clearance_cost_weight_);
+  if (used_planner == "rrt_star") {
+    RCLCPP_INFO(this->get_logger(),
+      "[PathPlanner] RRT* 완료: raw=%zu pts | 계획시간=%.1fms | iter=%d step=%.2fm goal_bias=%.2f rewire=%.2fm",
+      raw_path.size(), plan_ms, rrt_max_iterations_, rrt_step_size_,
+      rrt_goal_sample_rate_, rrt_rewire_radius_);
+  } else {
+    RCLCPP_INFO(this->get_logger(),
+      "[PathPlanner] A* 완료: raw=%zu pts | 계획시간=%.1fms | clearance_cost=%dcells/%.1f",
+      raw_path.size(), plan_ms, clearance_cost_cells, planner_clearance_cost_weight_);
+  }
 
   // Step 6: String-Pulling 스무딩
-  // A* raw_path는 격자 특성상 계단식 꺾임이 많음.
+  // A* raw_path는 격자 특성상 계단식 꺾임이 많고,
+  // RRT* raw_path는 sampling 특성상 들쭉날쭉할 수 있음.
   // smoothPath()로 시야각(LOS) 기반 불필요한 중간 점을 제거해 직선화.
   // 결과: 꺾임이 줄어들고 MPC가 더 부드럽게 추종 가능
   std::vector<std::pair<int,int>> smooth =

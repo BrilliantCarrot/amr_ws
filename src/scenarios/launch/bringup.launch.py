@@ -178,9 +178,11 @@ def launch_setup(context, *args, **kwargs):
     # goal_x/y는 use_planner=true일 때만 읽음
     goal_x_val = 2.0
     goal_y_val = 0.0
+    planner_type_val = 'astar'
     if use_planner_str == 'true':
         goal_x_val = float(LaunchConfiguration('goal_x').perform(context).strip())
         goal_y_val = float(LaunchConfiguration('goal_y').perform(context).strip())
+        planner_type_val = LaunchConfiguration('planner_type').perform(context).strip()
 
     common_nodes = [
         robot_state_publisher,
@@ -203,6 +205,7 @@ def launch_setup(context, *args, **kwargs):
                 f'--ros-args '
                 f'-p goal_x:={goal_x_val} '
                 f'-p goal_y:={goal_y_val} '
+                f'-p planner_type:=\\\"{planner_type_val}\\\" '
                 f'-p robot_radius:=0.50 '
                 f'-p odom_topic:=/map_ekf/odom '
                 f'-p replan_period_sec:=2.0 '
@@ -302,6 +305,10 @@ def generate_launch_description():
         'goal_y', default_value='0.0',
         description='기본 목표 y 좌표 [m] (map frame)'
     )
+    declare_planner_type = DeclareLaunchArgument(
+        'planner_type', default_value='astar',
+        description='global planner backend: astar 또는 rrt_star'
+    )
 
     return LaunchDescription([
         declare_world,
@@ -316,6 +323,7 @@ def generate_launch_description():
         declare_use_planner,   # W12 추가
         declare_goal_x,        # W12 추가
         declare_goal_y,        # W12 추가
+        declare_planner_type,
         # OpaqueFunction: LaunchConfiguration 값을 런치 시간에 문자열로 평가해서
         # 파이썬 연산(문자열 연결, 분기 등)이 가능하도록 함
         OpaqueFunction(function=launch_setup),

@@ -40,6 +40,7 @@ STALE_PROCESS_PATTERNS = [
     "watchdog_node",
     "state_machine_node",
     "pose_rmse_node",
+    "tracking_rmse_node",
     "obstacle_tracker_node",
     "obstacle_controller_node.py",
     "mpc_node",
@@ -226,6 +227,7 @@ def main():
     parser.add_argument("--post-goal-hold", type=float, default=10.0)
     parser.add_argument("--post-docked-hold", type=float, default=3.0)
     parser.add_argument("--avoid-policy", choices=["safe", "fast"], default="safe")
+    parser.add_argument("--planner-type", choices=["astar", "rrt_star"], default="astar")
     parser.add_argument("--keep-running", action="store_true")
     parser.add_argument("--quiet-nodes", action="store_true")
     args = parser.parse_args()
@@ -248,6 +250,7 @@ def main():
             f"goal_x:={args.goal_x}",
             f"goal_y:={args.goal_y}",
             f"world:={args.world}",
+            f"planner_type:={args.planner_type}",
             "mock_link:=true",
             "drop_rate:=0.0",
         ], quiet=args.quiet_nodes))
@@ -270,6 +273,11 @@ def main():
             ["ros2", "run", "safety", "watchdog_node"],
             ["ros2", "run", "safety", "state_machine_node"],
             ["ros2", "run", "estimation", "pose_rmse_node"],
+            [
+                "ros2", "run", "control_mpc", "tracking_rmse_node",
+                "--ros-args",
+                "-p", "use_path_error:=true",
+            ],
             ["ros2", "run", "control_mpc", "obstacle_tracker_node"],
             [
                 "ros2", "run", "control_mpc", "mpc_node",
