@@ -90,7 +90,7 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("path_viz_republish_period_sec", 1.0);
 
   // Planner backend 선택.
-  // astar: 기존 grid 기반 A*, rrt_star: sampling-based RRT*.
+  // astar: 기존 grid 기반 A*, rrt_star/prm: sampling-based planner.
   this->declare_parameter("planner_type", std::string("astar"));
   this->declare_parameter("rrt_max_iterations", 3000);
   this->declare_parameter("rrt_step_size", 0.25);
@@ -99,6 +99,11 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("rrt_rewire_radius", 0.60);
   this->declare_parameter("rrt_collision_check_resolution", 0.05);
   this->declare_parameter("rrt_random_seed", 7);
+  this->declare_parameter("prm_num_samples", 1200);
+  this->declare_parameter("prm_k_neighbors", 12);
+  this->declare_parameter("prm_connection_radius", 1.00);
+  this->declare_parameter("prm_collision_check_resolution", 0.05);
+  this->declare_parameter("prm_random_seed", 11);
 
   // A*에 반영할 LiDAR 장애물 안전 처리 파라미터임.
   // 사람 다리처럼 두 개로 나뉘는 장애물이 path planner에서 빈 공간으로 해석되지 않게 하기 위함임.
@@ -173,6 +178,12 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
   rrt_collision_check_resolution_ =
     this->get_parameter("rrt_collision_check_resolution").as_double();
   rrt_random_seed_ = this->get_parameter("rrt_random_seed").as_int();
+  prm_num_samples_ = this->get_parameter("prm_num_samples").as_int();
+  prm_k_neighbors_ = this->get_parameter("prm_k_neighbors").as_int();
+  prm_connection_radius_ = this->get_parameter("prm_connection_radius").as_double();
+  prm_collision_check_resolution_ =
+    this->get_parameter("prm_collision_check_resolution").as_double();
+  prm_random_seed_ = this->get_parameter("prm_random_seed").as_int();
 
   // 런치 파라미터로 목표가 이미 주입됐으므로 초기부터 has_goal_ = true
   has_goal_ = true;
@@ -237,7 +248,8 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
     "robot_r=%.2fm | periodic_replan=%d replan=%.1fs off_path=%d(%.2fm) | "
     "lidar_astar_mode=%s lidar_replan=%d map_update_replan=%d | docking=%d relax=%.2fm | wp_spacing=%.2fm | "
     "publish_min=%.1fs force=%.1fs avg_thr=%.2fm max_thr=%.2fm | clearance_cost=%.2fm/%.1f los_safety=%dcell | "
-    "planner=%s rrt_iter=%d step=%.2fm rewire=%.2fm | viz=%.1fs",
+    "planner=%s rrt_iter=%d step=%.2fm rewire=%.2fm | "
+    "prm_samples=%d k=%d radius=%.2fm | viz=%.1fs",
     goal_x_, goal_y_, robot_radius_,
     periodic_replan_enabled_ ? 1 : 0, replan_period_sec_,
     off_path_replan_enabled_ ? 1 : 0, off_path_replan_dist_,
@@ -248,6 +260,7 @@ PathPlannerNode::PathPlannerNode(const rclcpp::NodeOptions & options)
     planner_path_avg_change_threshold_, planner_path_max_change_threshold_,
     planner_clearance_cost_radius_, planner_clearance_cost_weight_, smoothing_los_safety_cells_,
     planner_type_.c_str(), rrt_max_iterations_, rrt_step_size_, rrt_rewire_radius_,
+    prm_num_samples_, prm_k_neighbors_, prm_connection_radius_,
     path_viz_republish_period_sec_);
 }
 
@@ -729,7 +742,7 @@ bool PathPlannerNode::plan()
 
   // Step 5: planner backend 경로 탐색
   // 팽창된 맵 위에서 (sx,sy) → (ex,ey) 경로를 찾고,
-  // 이후 smoothing/resampling/publish hysteresis는 A*와 RRT*가 공통으로 사용한다.
+  // 이후 smoothing/resampling/publish hysteresis는 모든 planner가 공통으로 사용한다.
   const int clearance_cost_cells =
     static_cast<int>(std::ceil(std::max(0.0, planner_clearance_cost_radius_) / res));
   auto t0 = std::chrono::high_resolution_clock::now();
@@ -753,6 +766,19 @@ bool PathPlannerNode::plan()
     raw_path = rrt_star_.findPath(
       inflated, W, H, sx, sy, ex, ey, rrt_params);
     used_planner = "rrt_star";
+  } else if (planner_type_ == "prm") {
+    PRMParams prm_params;
+    prm_params.num_samples = prm_num_samples_;
+    prm_params.k_neighbors = prm_k_neighbors_;
+    prm_params.connection_radius_cells =
+      std::max(prm_connection_radius_, res) / std::max(res, 1e-6);
+    prm_params.collision_check_step_cells =
+      std::max(prm_collision_check_resolution_, res) / std::max(res, 1e-6);
+    prm_params.random_seed = static_cast<unsigned int>(std::max(0, prm_random_seed_));
+
+    raw_path = prm_.findPath(
+      inflated, W, H, sx, sy, ex, ey, prm_params);
+    used_planner = "prm";
   } else {
     if (planner_type_ != "astar") {
       RCLCPP_WARN(this->get_logger(),
@@ -782,6 +808,10 @@ bool PathPlannerNode::plan()
       "[PathPlanner] RRT* 완료: raw=%zu pts | 계획시간=%.1fms | iter=%d step=%.2fm goal_bias=%.2f rewire=%.2fm",
       raw_path.size(), plan_ms, rrt_max_iterations_, rrt_step_size_,
       rrt_goal_sample_rate_, rrt_rewire_radius_);
+  } else if (used_planner == "prm") {
+    RCLCPP_INFO(this->get_logger(),
+      "[PathPlanner] PRM 완료: raw=%zu pts | 계획시간=%.1fms | samples=%d k=%d radius=%.2fm",
+      raw_path.size(), plan_ms, prm_num_samples_, prm_k_neighbors_, prm_connection_radius_);
   } else {
     RCLCPP_INFO(this->get_logger(),
       "[PathPlanner] A* 완료: raw=%zu pts | 계획시간=%.1fms | clearance_cost=%dcells/%.1f",
@@ -790,7 +820,7 @@ bool PathPlannerNode::plan()
 
   // Step 6: String-Pulling 스무딩
   // A* raw_path는 격자 특성상 계단식 꺾임이 많고,
-  // RRT* raw_path는 sampling 특성상 들쭉날쭉할 수 있음.
+  // RRT*/PRM raw_path는 sampling 특성상 들쭉날쭉할 수 있음.
   // smoothPath()로 시야각(LOS) 기반 불필요한 중간 점을 제거해 직선화.
   // 결과: 꺾임이 줄어들고 MPC가 더 부드럽게 추종 가능
   std::vector<std::pair<int,int>> smooth =

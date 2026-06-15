@@ -175,14 +175,17 @@ def launch_setup(context, *args, **kwargs):
     #   ros2 topic pub /goal_pose 로 동적 변경 가능.
     # --------------------------------------------------------
     use_planner_str = LaunchConfiguration('use_planner').perform(context).strip().lower()
+    use_local_planner_str = LaunchConfiguration('use_local_planner').perform(context).strip().lower()
     # goal_x/y는 use_planner=true일 때만 읽음
     goal_x_val = 2.0
     goal_y_val = 0.0
     planner_type_val = 'astar'
+    local_planner_type_val = 'dwa'
     if use_planner_str == 'true':
         goal_x_val = float(LaunchConfiguration('goal_x').perform(context).strip())
         goal_y_val = float(LaunchConfiguration('goal_y').perform(context).strip())
         planner_type_val = LaunchConfiguration('planner_type').perform(context).strip()
+        local_planner_type_val = LaunchConfiguration('local_planner_type').perform(context).strip()
 
     common_nodes = [
         robot_state_publisher,
@@ -229,6 +232,46 @@ def launch_setup(context, *args, **kwargs):
             ]
         )
         common_nodes.append(path_planner_action)
+
+        if use_local_planner_str == 'true' and local_planner_type_val == 'dwa':
+            dwa_local_planner_action = TimerAction(
+                period=16.0,
+                actions=[
+                    ExecuteProcess(
+                        cmd=[
+                            '/bin/bash', '-c',
+                            f'source /opt/ros/humble/setup.bash && '
+                            f'source /home/lyj/amr_ws/install/setup.bash && '
+                            f'ros2 run planning dwa_local_planner_node '
+                            f'--ros-args '
+                            f'-p global_path_topic:=/planned_path '
+                            f'-p local_path_topic:=/local_path '
+                            f'-p odom_topic:=/map_ekf/odom '
+                            f'-p obstacle_topic:=/obstacles/detected '
+                            f'-p map_topic:=/map '
+                            f'-p sim_time:=1.60 '
+                            f'-p sim_dt:=0.10 '
+                            f'-p v_max:=0.18 '
+                            f'-p w_max:=0.75 '
+                            f'-p lookahead_dist:=1.20 '
+                            f'-p path_heading_weight:=2.0 '
+                            f'-p turn_weight:=0.45 '
+                            f'-p w_smooth_weight:=0.8 '
+                            f'-p heading_change_weight:=0.35 '
+                            f'-p obstacle_safety_margin:=0.22 '
+                            f'-p map_collision_check:=true '
+                            f'-p robot_radius:=0.48 '
+                            f'-p map_safety_margin:=0.10 '
+                            f'-p map_clearance_weight:=2.0 '
+                            f'-p map_clearance_desired:=0.38 '
+                            f'-p map_clearance_max_search:=0.90'
+                        ],
+                        output='screen',
+                        shell=False
+                    )
+                ]
+            )
+            common_nodes.append(dwa_local_planner_action)
 
     if use_mock_link:
         common_nodes.append(mock_link_action)
@@ -307,7 +350,17 @@ def generate_launch_description():
     )
     declare_planner_type = DeclareLaunchArgument(
         'planner_type', default_value='astar',
-        description='global planner backend: astar 또는 rrt_star'
+        description='global planner backend: astar, rrt_star, prm'
+    )
+    declare_use_local_planner = DeclareLaunchArgument(
+        'use_local_planner',
+        default_value='false',
+        description='true이면 DWA local planner를 /planned_path와 MPC 사이에 실행'
+    )
+    declare_local_planner_type = DeclareLaunchArgument(
+        'local_planner_type',
+        default_value='dwa',
+        description='local planner backend: dwa'
     )
 
     return LaunchDescription([
@@ -324,6 +377,8 @@ def generate_launch_description():
         declare_goal_x,        # W12 추가
         declare_goal_y,        # W12 추가
         declare_planner_type,
+        declare_use_local_planner,
+        declare_local_planner_type,
         # OpaqueFunction: LaunchConfiguration 값을 런치 시간에 문자열로 평가해서
         # 파이썬 연산(문자열 연결, 분기 등)이 가능하도록 함
         OpaqueFunction(function=launch_setup),

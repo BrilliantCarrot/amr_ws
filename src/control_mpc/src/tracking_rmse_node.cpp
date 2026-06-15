@@ -79,6 +79,8 @@ public:
     // closest-point error를 계산한다. MPC/LQR 비교 실험에서 공정한 지표로 사용.
     this->declare_parameter<bool>("use_path_error", false);
     use_path_error_ = this->get_parameter("use_path_error").as_bool();
+    this->declare_parameter<std::string>("path_topic", "/planned_path");
+    path_topic_ = this->get_parameter("path_topic").as_string();
 
     auto reliable_qos = rclcpp::QoS(10).reliable();
     auto sensor_qos   = rclcpp::SensorDataQoS();
@@ -111,7 +113,7 @@ public:
     );
 
     path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
-      "/planned_path",
+      path_topic_,
       reliable_qos,
       std::bind(&TrackingRmseNode::pathCallback, this, std::placeholders::_1)
     );
@@ -133,6 +135,8 @@ public:
     RCLCPP_INFO(this->get_logger(),
       "[TrackingRmseNode] Path error mode: %s", use_path_error_ ? "ON" : "OFF");
     RCLCPP_INFO(this->get_logger(),
+      "[TrackingRmseNode] Path topic: %s", path_topic_.c_str());
+    RCLCPP_INFO(this->get_logger(),
       "[TrackingRmseNode] 발행: /metrics/tracking_rmse");
   }
 
@@ -153,7 +157,7 @@ private:
     has_path_ = true;
 
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
-      "[TrackingRmseNode] /planned_path 수신: %zu pts", path_points_.size());
+      "[TrackingRmseNode] %s 수신: %zu pts", path_topic_.c_str(), path_points_.size());
   }
 
   bool closestPathPose(double x, double y, double & ref_x, double & ref_y, double & ref_yaw)
@@ -279,7 +283,8 @@ private:
     if (use_path_error_) {
       if (!closestPathPose(gt_x_, gt_y_, eval_ref_x, eval_ref_y, eval_ref_yaw)) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
-          "[TrackingRmseNode] use_path_error=true이나 /planned_path 미수신. reference_pose 기준으로 fallback.");
+          "[TrackingRmseNode] use_path_error=true이나 %s 미수신. reference_pose 기준으로 fallback.",
+          path_topic_.c_str());
       }
     }
 
@@ -373,6 +378,7 @@ private:
   int         sample_count_;
   int         window_size_;
   std::string robot_name_;
+  std::string path_topic_{"/planned_path"};
   bool        use_path_error_ = false;
   bool        has_path_ = false;
   std::vector<std::pair<double, double>> path_points_;

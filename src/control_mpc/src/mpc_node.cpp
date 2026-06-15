@@ -10,6 +10,13 @@ namespace control_mpc
 namespace
 {
 
+double yawFromQuat(const geometry_msgs::msg::Quaternion & q)
+{
+  return std::atan2(
+    2.0 * (q.w * q.z + q.x * q.y),
+    1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+}
+
 void publishMissionPhase(
   const rclcpp::Publisher<std_msgs::msg::String>::SharedPtr & pub,
   const char * phase)
@@ -64,6 +71,8 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("slip_ratio",      0.0); // 기본값은 슬립 없음
   this->declare_parameter("artificial_load_ms", 0.0); // 기본 cpu 부하는 없음
   this->declare_parameter("odom_topic", std::string("/odom"));
+  this->declare_parameter("path_topic", std::string("/planned_path"));
+  this->declare_parameter("use_path_orientation", false);
   // W12: 글로벌 경로계획 연동 파라미터
   // true: path_planner_node의 /planned_path 수신 후 제어 시작
   // false: 기존 hardcoded 경로(trajectory_type) 사용 (하위호환)
@@ -130,6 +139,8 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   this->declare_parameter("front_reverse_exit_distance", 0.34);
   this->declare_parameter("front_reverse_speed", 0.06);
   this->declare_parameter("front_reverse_duration", 0.80);
+  this->declare_parameter("front_reverse_lateral_enter", 0.55);
+  this->declare_parameter("front_reverse_hard_clearance", 0.10);
   this->declare_parameter("front_approach_rate_threshold", 0.025);
   this->declare_parameter("front_avoid_min_forward_speed", 0.08);
   this->declare_parameter("front_avoid_policy", "safe");
@@ -158,6 +169,9 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   slip_ratio_       = this->get_parameter("slip_ratio").as_double();
   artificial_load_ms_ = this->get_parameter("artificial_load_ms").as_double();
   odom_topic_ = this->get_parameter("odom_topic").as_string();
+  path_topic_ = this->get_parameter("path_topic").as_string();
+  use_path_orientation_ =
+    this->get_parameter("use_path_orientation").as_bool() || path_topic_ != "/planned_path";
   use_global_planner_ = this->get_parameter("use_global_planner").as_bool();
   enable_docking_ = this->get_parameter("enable_docking").as_bool();
   path_accept_min_interval_sec_ = this->get_parameter("path_accept_min_interval_sec").as_double();
@@ -224,6 +238,8 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   front_reverse_exit_distance_ = this->get_parameter("front_reverse_exit_distance").as_double();
   front_reverse_speed_ = this->get_parameter("front_reverse_speed").as_double();
   front_reverse_duration_ = this->get_parameter("front_reverse_duration").as_double();
+  front_reverse_lateral_enter_ = this->get_parameter("front_reverse_lateral_enter").as_double();
+  front_reverse_hard_clearance_ = this->get_parameter("front_reverse_hard_clearance").as_double();
   front_approach_rate_threshold_ = this->get_parameter("front_approach_rate_threshold").as_double();
   front_avoid_min_forward_speed_ = this->get_parameter("front_avoid_min_forward_speed").as_double();
   front_avoid_policy_ = this->get_parameter("front_avoid_policy").as_string();
@@ -319,7 +335,7 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
     initWaypoints();
   } else {
     RCLCPP_INFO(this->get_logger(),
-      "[MPC] 글로벌 경로계획 모드: /planned_path 대기 중...");
+      "[MPC] 글로벌 경로계획 모드: %s 대기 중...", path_topic_.c_str());
   }
 
   // --- 상태 초기화 ---
@@ -357,10 +373,10 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
   "/safety/state", qos_reliable,
   std::bind(&MpcNode::safetyStateCallback, this, std::placeholders::_1), sensor_opt);
 
-  // W12: /planned_path 구독 — path_planner_node가 발행한 A* 경로 수신
+  // W12: path_topic 구독 — path_planner_node 또는 local planner가 발행한 경로 수신
   // use_global_planner=true일 때만 의미있으나, 항상 구독해두어 런타임 전환 가능
   path_sub_ = this->create_subscription<nav_msgs::msg::Path>(
-    "/planned_path", rclcpp::QoS(1).reliable().transient_local(),
+    path_topic_, rclcpp::QoS(1).reliable().transient_local(),
     std::bind(&MpcNode::pathCallback, this, std::placeholders::_1), sensor_opt);
 
   RCLCPP_INFO(this->get_logger(), "W9: Obstacle Tracker 구독 시작"); // 확인용 로그 추가
@@ -395,8 +411,8 @@ MpcNode::MpcNode(const rclcpp::NodeOptions & options)
     std::chrono::milliseconds(static_cast<int>(mpc_params_.dt * 1000)),
     std::bind(&MpcNode::controlCallback, this), control_cb_group_);
 
-  RCLCPP_INFO(this->get_logger(), "MpcNode started. Waiting for %s...",
-    odom_topic_.c_str());
+  RCLCPP_INFO(this->get_logger(), "MpcNode started. Waiting for %s... path_topic=%s",
+    odom_topic_.c_str(), path_topic_.c_str());
 }
 
 // ============================================================
@@ -686,7 +702,8 @@ double MpcNode::computeWaypointPathDifference(
 // [처리]
 //   nav_msgs/Path (PoseStamped[]) → StateVec[] 변환
 //   - x, y: 경로 점의 세계 좌표
-//   - θ    : 0으로 초기화 → generateReference()에서 연속 yaw 재계산
+//   - θ    : 기본은 경로 위치 차분으로 재계산
+//            DWA /local_path 사용 시에는 Pose orientation의 부드러운 yaw를 사용
 //   - v    : v_ref_ (파라미터)
 //   - ω    : 0 (MPC가 각속도 제어)
 //
@@ -708,7 +725,7 @@ void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
     StateVec wp;
     wp(0) = pose_stamped.pose.position.x;
     wp(1) = pose_stamped.pose.position.y;
-    wp(2) = 0.0;    // θ: generateReference()에서 실시간 계산
+    wp(2) = use_path_orientation_ ? yawFromQuat(pose_stamped.pose.orientation) : 0.0;
     wp(3) = v_ref_;
     wp(4) = 0.0;
     new_waypoints.push_back(wp);
@@ -751,6 +768,7 @@ void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
   double avg_diff = 0.0;
   double max_diff = 0.0;
   double elapsed = 1e9;
+  const bool local_path_mode = path_topic_ != "/planned_path";
 
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
@@ -776,10 +794,11 @@ void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
         (avg_diff > path_accept_avg_change_threshold_ * 0.5 ||
          max_diff > path_accept_max_change_threshold_ * 0.5);
 
-      // 경로를 새로 받아들이면 closest_wp_idx_=0으로 리셋되므로
-      // 중간 정도로 다른 경로를 5초마다 받아도 stop-and-go가 생긴다.
-      // force interval 전에는 정말 크게 달라진 경로만 즉시 수락한다.
-      if (local_escape_replan) {
+      // /local_path는 DWA 같은 local planner가 현재 pose 기준으로 자주 갱신하는 경로다.
+      // 전역 경로용 12초 게이트를 그대로 쓰면 local planner 출력이 stale해져 코너에서 벽을 자를 수 있다.
+      if (local_path_mode) {
+        accept_path = elapsed >= 0.15;
+      } else if (local_escape_replan) {
         accept_path = true;
       } else if (elapsed < path_accept_min_interval_sec_) {
         accept_path = false;
@@ -788,12 +807,13 @@ void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
       }
     }
 
-    const bool protected_undock_phase =
+    const bool protected_path_phase =
+      mission_phase_ == MissionPhase::DOCKING ||
       mission_phase_ == MissionPhase::DOCKED ||
       mission_phase_ == MissionPhase::UNDOCKING ||
       mission_phase_ == MissionPhase::UNDOCKING_RETREAT;
 
-    if (accept_path && protected_undock_phase && !is_return_path) {
+    if (accept_path && protected_path_phase && !is_return_path) {
       accept_path = false;
       ignore_non_return_path_while_docked = true;
     }
@@ -860,8 +880,8 @@ void MpcNode::pathCallback(const nav_msgs::msg::Path::SharedPtr msg)
       return;
     }
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-      "[MPC] /planned_path 수락 보류 | avg=%.3fm max=%.3fm elapsed=%.2fs",
-      avg_diff, max_diff, elapsed);
+      "[MPC] %s 수락 보류 | avg=%.3fm max=%.3fm elapsed=%.2fs",
+      path_topic_.c_str(), avg_diff, max_diff, elapsed);
     return;
   }
 
@@ -941,7 +961,8 @@ void MpcNode::controlCallback()
   // SingleThread이므로 waypoints_를 락 없이 읽어도 안전
   if (use_global_planner_ && waypoints_.empty()) {
     RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-      "[MPC] /planned_path 대기 중... (path_planner_node 실행 여부 확인)");
+      "[MPC] %s 대기 중... (planner/local planner 실행 여부 확인)",
+      path_topic_.c_str());
     publishStop();
     return;
   }
@@ -1316,6 +1337,18 @@ void MpcNode::controlCallback()
       fast_policy &&
       front_avoid_turn_dir_ != 0 &&
       this->now() < front_fast_escape_until_;
+    const bool reverse_lateral_allowed =
+      found_front_obstacle &&
+      std::abs(best_lateral) <= front_reverse_lateral_enter_;
+    const bool reverse_hard_required =
+      found_front_obstacle &&
+      front_clearance_filtered_ <= front_reverse_hard_clearance_;
+    const bool reverse_needed =
+      reverse_hard_required ||
+      (reverse_lateral_allowed &&
+       (front_clearance_filtered_ <= front_reverse_enter_distance_ ||
+        (obstacle_approaching &&
+         front_clearance_filtered_ <= front_reverse_exit_distance_)));
 
     if (fast_escape_candidate) {
       front_fast_escape_until_ =
@@ -1341,9 +1374,7 @@ void MpcNode::controlCallback()
         }
       } else if (!fast_escape_candidate &&
                  !fast_escape_hold_active &&
-                 (front_clearance_filtered_ <= front_reverse_enter_distance_ ||
-                  (obstacle_approaching &&
-                   front_clearance_filtered_ <= front_reverse_exit_distance_))) {
+                 reverse_needed) {
         front_avoid_mode_ = FrontAvoidMode::REVERSE;
         front_reverse_until_ =
           this->now() + rclcpp::Duration::from_seconds(front_reverse_duration_);
@@ -1377,7 +1408,7 @@ void MpcNode::controlCallback()
     }
 
     if (front_avoid_mode_ == FrontAvoidMode::REVERSE) {
-      v_cmd = -std::clamp(front_reverse_speed_, 0.02, std::abs(mpc_params_.v_min));
+      v_cmd = -std::clamp(front_reverse_speed_, 0.02, 0.50);
       w_cmd = 0.0;
     } else if (front_avoid_mode_ == FrontAvoidMode::HOLD) {
       v_cmd = 0.0;
@@ -1710,7 +1741,9 @@ void MpcNode::controlCallback()
     // FrontSafety HOLD/REVERSE 중에는 CBF가 반대 방향 회전을 만들며 흔들릴 수 있다.
     // 이 단계에서는 FrontSafety 상태기계가 정한 정지/후진 명령을 그대로 우선한다.
     if (front_safety_reverse_active_) {
-      v_pub = std::clamp(v_cmd, mpc_params_.v_min, 0.0);
+      const double reverse_v_min =
+        -std::max(std::abs(mpc_params_.v_min), std::clamp(front_reverse_speed_, 0.02, 0.50));
+      v_pub = std::clamp(v_cmd, reverse_v_min, 0.0);
       w_pub = 0.0;
     } else {
       v_pub = 0.0;
@@ -1731,7 +1764,7 @@ void MpcNode::controlCallback()
     double v_safe = v_cmd;
     double w_safe = w_cmd;
 
-    RCLCPP_WARN_THROTTLE(
+    RCLCPP_INFO_THROTTLE(
       this->get_logger(),
       *this->get_clock(),
       500,
@@ -1777,7 +1810,7 @@ void MpcNode::controlCallback()
       );
     }
 
-    RCLCPP_WARN_THROTTLE(
+    RCLCPP_INFO_THROTTLE(
       this->get_logger(),
       *this->get_clock(),
       500,
@@ -2138,7 +2171,9 @@ std::vector<StateVec> MpcNode::generateReference(const StateVec & x0)
     double ref_yaw_base = (k == 0) ? x0(2) : x_ref[k - 1](2);
     double raw_yaw;
 
-    if (std::abs(dx) < 1e-5 && std::abs(dy) < 1e-5) {
+    if (use_path_orientation_) {
+      raw_yaw = waypoints_[idx](2);
+    } else if (std::abs(dx) < 1e-5 && std::abs(dy) < 1e-5) {
       raw_yaw = ref_yaw_base;
     } else {
       raw_yaw = std::atan2(dy, dx);

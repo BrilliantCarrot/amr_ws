@@ -45,6 +45,7 @@ STALE_PROCESS_PATTERNS = [
     "obstacle_controller_node.py",
     "mpc_node",
     "path_planner_node",
+    "dwa_local_planner_node",
     "mock_link_node",
     "parameter_bridge",
     "robot_state_publisher",
@@ -227,11 +228,13 @@ def main():
     parser.add_argument("--post-goal-hold", type=float, default=10.0)
     parser.add_argument("--post-docked-hold", type=float, default=3.0)
     parser.add_argument("--avoid-policy", choices=["safe", "fast"], default="safe")
-    parser.add_argument("--planner-type", choices=["astar", "rrt_star"], default="astar")
+    parser.add_argument("--planner-type", choices=["astar", "rrt_star", "prm"], default="astar")
+    parser.add_argument("--use-local-planner", action="store_true")
+    parser.add_argument("--local-planner-type", choices=["dwa"], default="dwa")
     parser.add_argument("--keep-running", action="store_true")
     parser.add_argument("--quiet-nodes", action="store_true")
     args = parser.parse_args()
-    fast_escape_speed = 0.28
+    fast_escape_speed = 0.35
 
     procs = []
     slam_proc = None
@@ -251,6 +254,8 @@ def main():
             f"goal_y:={args.goal_y}",
             f"world:={args.world}",
             f"planner_type:={args.planner_type}",
+            f"use_local_planner:={'true' if args.use_local_planner else 'false'}",
+            f"local_planner_type:={args.local_planner_type}",
             "mock_link:=true",
             "drop_rate:=0.0",
         ], quiet=args.quiet_nodes))
@@ -266,6 +271,7 @@ def main():
         set_drop_rate(0.0)
 
         print("[demo] starting AMR nodes")
+        mpc_path_topic = "/local_path" if args.use_local_planner else "/planned_path"
         node_cmds = [
             ["ros2", "run", "estimation", "ekf_node"],
             ["ros2", "run", "estimation", "map_ekf_node"],
@@ -277,6 +283,7 @@ def main():
                 "ros2", "run", "control_mpc", "tracking_rmse_node",
                 "--ros-args",
                 "-p", "use_path_error:=true",
+                "-p", f"path_topic:={mpc_path_topic}",
             ],
             ["ros2", "run", "control_mpc", "obstacle_tracker_node"],
             [
@@ -284,8 +291,10 @@ def main():
                 "--ros-args",
                 "-p", "use_global_planner:=true",
                 "-p", "odom_topic:=/map_ekf/odom",
-                "-p", "v_ref_:=0.1",
-                "-p", "v_max:=0.18",
+                "-p", f"path_topic:={mpc_path_topic}",
+                "-p", f"use_path_orientation:={'true' if args.use_local_planner else 'false'}",
+                "-p", "v_ref_:=0.15",
+                "-p", "v_max:=0.2",
                 "-p", "tracking_min_forward_speed:=0.0",
                 "-p", "front_slow_distance:=1.30",
                 "-p", "front_stop_distance:=0.45",
@@ -301,10 +310,12 @@ def main():
                 "-p", "front_fast_escape_turn:=0.18",
                 "-p", "front_fast_escape_hold_sec:=1.20",
                 "-p", "front_hold_release_distance:=0.85",
-                "-p", "front_reverse_enter_distance:=0.32",
-                "-p", "front_reverse_exit_distance:=0.55",
-                "-p", "front_reverse_speed:=0.12",
-                "-p", "front_reverse_duration:=1.40",
+                "-p", "front_reverse_enter_distance:=0.45",
+                "-p", "front_reverse_exit_distance:=0.65",
+                "-p", "front_reverse_speed:=0.28",
+                "-p", "front_reverse_duration:=1.30",
+                "-p", "front_reverse_lateral_enter:=0.55",
+                "-p", "front_reverse_hard_clearance:=0.10",
                 "-p", "front_approach_rate_threshold:=0.020",
                 "-p", "local_static_front_safety_enabled:=false",
                 "-p", "cbf_d_safe:=0.35",

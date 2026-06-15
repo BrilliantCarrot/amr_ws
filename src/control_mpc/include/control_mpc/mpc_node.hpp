@@ -232,6 +232,8 @@ private:
   double artificial_load_ms_ = 0.0;
   double v_ref_ = 0.1;
   std::string odom_topic_ = "/odom";
+  std::string path_topic_ = "/planned_path";
+  bool use_path_orientation_ = false;
 
   // W7: 진짜 제어 지연 주입을 위한 큐
   std::deque<geometry_msgs::msg::Twist> delay_queue_;
@@ -278,6 +280,8 @@ private:
   double front_reverse_exit_distance_ = 0.34;
   double front_reverse_speed_ = 0.06;
   double front_reverse_duration_ = 0.80;
+  double front_reverse_lateral_enter_ = 0.55;
+  double front_reverse_hard_clearance_ = 0.10;
   double front_approach_rate_threshold_ = 0.025;
   double front_avoid_min_forward_speed_ = 0.08;
   std::string front_avoid_policy_ = "safe";

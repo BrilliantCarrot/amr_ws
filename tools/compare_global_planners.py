@@ -22,9 +22,11 @@ how to use:
   python3 tools/compare_global_planners.py \
   --astar-bag /home/lyj/amr_ws/bags/planner_astar \
   --rrt-bag /home/lyj/amr_ws/bags/planner_rrt_star \
+  --prm-bag /home/lyj/amr_ws/bags/planner_prm \
   --astar-log /home/lyj/astar_result.txt \
   --rrt-log /home/lyj/rrt_result.txt \
-  --out-prefix /home/lyj/amr_ws/planner_compare    
+  --prm-log /home/lyj/prm_result.txt \
+  --out-prefix /home/lyj/amr_ws/planner_compare
 """
 
 import argparse
@@ -157,8 +159,10 @@ def parse_planner_log(log_path: str, planner_label: str):
     text = path.read_text(errors="ignore")
     if planner_label == "astar":
         pattern = re.compile(r"A\* 완료: raw=(\d+) pts \| 계획시간=([0-9.]+)ms")
-    else:
+    elif planner_label == "rrt_star":
         pattern = re.compile(r"RRT\* 완료: raw=(\d+) pts \| 계획시간=([0-9.]+)ms")
+    else:
+        pattern = re.compile(r"PRM 완료: raw=(\d+) pts \| 계획시간=([0-9.]+)ms")
 
     raw_counts = []
     plan_ms = []
@@ -282,7 +286,13 @@ def analyze_bag(label: str, bag_path: str, log_path: str = None):
             "docked": first_docked is not None,
         })
 
-    planner_hint = "astar" if label.lower().startswith("a") else "rrt_star"
+    lower_label = label.lower()
+    if lower_label.startswith("a"):
+        planner_hint = "astar"
+    elif lower_label.startswith("p"):
+        planner_hint = "prm"
+    else:
+        planner_hint = "rrt_star"
     stats.update(parse_planner_log(log_path, planner_hint))
     return stats
 
@@ -325,34 +335,48 @@ def fmt(value):
     return str(value)
 
 
-def print_table(astar, rrt):
-    print("\nA* vs RRT* global planner comparison")
-    print("=" * 88)
-    print(f"{'metric':<32} {'A*':>18} {'RRT*':>18} {'unit':>10}")
-    print("-" * 88)
+def print_table(planners):
+    title = " vs ".join(stats["label"] for stats in planners)
+    print(f"\n{title} global planner comparison")
+    width = 44 + 18 * len(planners)
+    print("=" * width)
+    header = f"{'metric':<32}"
+    for stats in planners:
+        header += f" {stats['label']:>18}"
+    header += f" {'unit':>10}"
+    print(header)
+    print("-" * width)
     for key, label, unit in FIELDS:
-        print(f"{label:<32} {fmt(astar.get(key)):>18} {fmt(rrt.get(key)):>18} {unit:>10}")
-    print("=" * 88)
+        row = f"{label:<32}"
+        for stats in planners:
+            row += f" {fmt(stats.get(key)):>18}"
+        row += f" {unit:>10}"
+        print(row)
+    print("=" * width)
 
 
-def write_csv(out_prefix: str, astar, rrt):
+def write_csv(out_prefix: str, planners):
     path = Path(out_prefix + ".csv")
     with path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["metric", "astar", "rrt_star", "unit"])
+        writer.writerow(["metric"] + [stats["label"] for stats in planners] + ["unit"])
         for key, label, unit in FIELDS:
-            writer.writerow([label, astar.get(key), rrt.get(key), unit])
+            writer.writerow([label] + [stats.get(key) for stats in planners] + [unit])
     return path
 
 
-def write_markdown(out_prefix: str, astar, rrt):
+def write_markdown(out_prefix: str, planners):
     path = Path(out_prefix + ".md")
     with path.open("w") as f:
-        f.write("# A* vs RRT* Global Planner Comparison\n\n")
-        f.write("| Metric | A* | RRT* | Unit |\n")
-        f.write("|---|---:|---:|---|\n")
+        title = " vs ".join(stats["label"] for stats in planners)
+        f.write(f"# {title} Global Planner Comparison\n\n")
+        f.write("| Metric | " + " | ".join(stats["label"] for stats in planners) + " | Unit |\n")
+        f.write("|---|" + "---:|" * len(planners) + "---|\n")
         for key, label, unit in FIELDS:
-            f.write(f"| {label} | {fmt(astar.get(key))} | {fmt(rrt.get(key))} | {unit} |\n")
+            f.write(
+                f"| {label} | "
+                + " | ".join(fmt(stats.get(key)) for stats in planners)
+                + f" | {unit} |\n")
     return path
 
 
@@ -472,7 +496,19 @@ def add_legend_if_any(ax, **kwargs):
         ax.legend(**kwargs)
 
 
-def plot_kpi_bars(astar_stats, rrt_stats, plot_dir: Path):
+PLANNER_COLORS = {
+    "A*": "#4C78A8",
+    "RRT*": "#F58518",
+    "PRM": "#54A24B",
+}
+
+
+def planner_color(label, index):
+    fallback = ["#4C78A8", "#F58518", "#54A24B", "#B279A2", "#E45756"]
+    return PLANNER_COLORS.get(label, fallback[index % len(fallback)])
+
+
+def plot_kpi_bars(planners, plot_dir: Path):
     import matplotlib.pyplot as plt
 
     metrics = [
@@ -485,30 +521,35 @@ def plot_kpi_bars(astar_stats, rrt_stats, plot_dir: Path):
     ]
 
     names = []
-    astar_values = []
-    rrt_values = []
+    values = [[] for _ in planners]
     units = []
     for key, name, unit in metrics:
-        a = finite_metric(astar_stats, key)
-        r = finite_metric(rrt_stats, key)
-        if a is None and r is None:
+        metric_values = [finite_metric(stats, key) for stats in planners]
+        if all(value is None for value in metric_values):
             continue
         names.append(name)
-        astar_values.append(np.nan if a is None else a)
-        rrt_values.append(np.nan if r is None else r)
+        for idx, value in enumerate(metric_values):
+            values[idx].append(np.nan if value is None else value)
         units.append(unit)
 
     if not names:
         return None
 
     x = np.arange(len(names))
-    width = 0.36
+    width = min(0.75 / max(len(planners), 1), 0.36)
     fig, ax = plt.subplots(figsize=(11, 5.5))
-    ax.bar(x - width / 2.0, astar_values, width, label="A*", color="#4C78A8")
-    ax.bar(x + width / 2.0, rrt_values, width, label="RRT*", color="#F58518")
+    center_offset = (len(planners) - 1) * width / 2.0
+    for idx, stats in enumerate(planners):
+        ax.bar(
+            x - center_offset + idx * width,
+            values[idx],
+            width,
+            label=stats["label"],
+            color=planner_color(stats["label"], idx),
+        )
     ax.set_xticks(x)
     ax.set_xticklabels([f"{name}\n[{unit}]" for name, unit in zip(names, units)])
-    ax.set_title("A* vs RRT* KPI Summary")
+    ax.set_title("Global Planner KPI Summary")
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -519,23 +560,20 @@ def plot_kpi_bars(astar_stats, rrt_stats, plot_dir: Path):
     return out
 
 
-def plot_trajectory(astar_plot, rrt_plot, plot_dir: Path):
+def plot_trajectory(plots, plot_dir: Path):
     import matplotlib.pyplot as plt
 
-    has_any = any([
-        astar_plot["initial_path"][0].size,
-        rrt_plot["initial_path"][0].size,
-        astar_plot["odom_x"].size,
-        rrt_plot["odom_x"].size,
-        astar_plot["gt_robot_x"].size,
-        rrt_plot["gt_robot_x"].size,
-    ])
+    has_any = any(
+        plot["initial_path"][0].size or plot["odom_x"].size or plot["gt_robot_x"].size
+        for plot in plots
+    )
     if not has_any:
         return None
 
     fig, ax = plt.subplots(figsize=(8, 8))
 
-    for plot, color in [(astar_plot, "#4C78A8"), (rrt_plot, "#F58518")]:
+    for idx, plot in enumerate(plots):
+        color = planner_color(plot["label"], idx)
         label = plot["label"]
         px, py = plot["initial_path"]
         if px.size:
@@ -546,12 +584,13 @@ def plot_trajectory(astar_plot, rrt_plot, plot_dir: Path):
         elif plot["gt_robot_x"].size:
             ax.plot(plot["gt_robot_x"], plot["gt_robot_y"], color=color, linewidth=1.8, label=f"{label} GT")
 
-    for plot, color in [(astar_plot, "#72B7B2"), (rrt_plot, "#B279A2")]:
+    obstacle_colors = ["#72B7B2", "#B279A2", "#59A14F", "#ECA82C", "#E45756"]
+    for idx, plot in enumerate(plots):
         if plot["obs_x"].size:
             ax.plot(
                 plot["obs_x"],
                 plot["obs_y"],
-                color=color,
+                color=obstacle_colors[idx % len(obstacle_colors)],
                 linewidth=1.5,
                 alpha=0.8,
                 label=f"{plot['label']} dynamic obstacle",
@@ -568,13 +607,14 @@ def plot_trajectory(astar_plot, rrt_plot, plot_dir: Path):
     return out
 
 
-def plot_time_series(astar_plot, rrt_plot, plot_dir: Path):
+def plot_time_series(plots, plot_dir: Path):
     import matplotlib.pyplot as plt
 
     fig, axes = plt.subplots(3, 2, figsize=(13, 10), sharex=False)
     axes = axes.reshape(3, 2)
 
-    for plot, color in [(astar_plot, "#4C78A8"), (rrt_plot, "#F58518")]:
+    for idx, plot in enumerate(plots):
+        color = planner_color(plot["label"], idx)
         label = plot["label"]
         if plot["cmd_t"].size:
             axes[0, 0].plot(plot["cmd_t"], plot["v"], color=color, linewidth=1.2, label=label)
@@ -597,7 +637,7 @@ def plot_time_series(astar_plot, rrt_plot, plot_dir: Path):
     for ax in axes.ravel():
         add_legend_if_any(ax, loc="best", fontsize=9)
 
-    fig.suptitle("A* vs RRT* Time-Series Comparison", fontsize=15)
+    fig.suptitle("Global Planner Time-Series Comparison", fontsize=15)
     fig.tight_layout()
 
     out = plot_dir / "planner_time_series.png"
@@ -606,11 +646,11 @@ def plot_time_series(astar_plot, rrt_plot, plot_dir: Path):
     return out
 
 
-def plot_timeline(astar_plot, rrt_plot, plot_dir: Path):
+def plot_timeline(plots, plot_dir: Path):
     import matplotlib.pyplot as plt
 
     events = []
-    for row, plot in enumerate([astar_plot, rrt_plot]):
+    for row, plot in enumerate(plots):
         for t, phase in plot["mission_events"]:
             if phase in {"TRACKING", "DOCKING", "DOCKED"}:
                 events.append((t, row, phase, plot["label"]))
@@ -635,8 +675,8 @@ def plot_timeline(astar_plot, rrt_plot, plot_dir: Path):
         ax.scatter(t, y, s=60, color=color_map.get(name, "#666666"), zorder=3)
         ax.text(t, y + 0.06, name, rotation=35, ha="left", va="bottom", fontsize=8)
 
-    ax.set_yticks([0, 1])
-    ax.set_yticklabels(["A*", "RRT*"])
+    ax.set_yticks(list(range(len(plots))))
+    ax.set_yticklabels([plot["label"] for plot in plots])
     configure_axes(ax, "Mission and Safety Timeline", "time [s]", "")
     fig.tight_layout()
 
@@ -646,7 +686,7 @@ def plot_timeline(astar_plot, rrt_plot, plot_dir: Path):
     return out
 
 
-def write_plots(out_prefix: str, astar_stats, rrt_stats, astar_bag: str, rrt_bag: str):
+def write_plots(out_prefix: str, planners):
     mpl_config = Path("/tmp/matplotlib")
     mpl_config.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("MPLCONFIGDIR", str(mpl_config))
@@ -659,15 +699,14 @@ def write_plots(out_prefix: str, astar_stats, rrt_stats, astar_bag: str, rrt_bag
     plot_dir = Path(out_prefix + "_plots")
     plot_dir.mkdir(parents=True, exist_ok=True)
 
-    astar_plot = collect_plot_data("A*", astar_bag)
-    rrt_plot = collect_plot_data("RRT*", rrt_bag)
+    plots = [collect_plot_data(stats["label"], stats["bag"]) for stats in planners]
 
     outputs = []
     for out in [
-        plot_kpi_bars(astar_stats, rrt_stats, plot_dir),
-        plot_trajectory(astar_plot, rrt_plot, plot_dir),
-        plot_time_series(astar_plot, rrt_plot, plot_dir),
-        plot_timeline(astar_plot, rrt_plot, plot_dir),
+        plot_kpi_bars(planners, plot_dir),
+        plot_trajectory(plots, plot_dir),
+        plot_time_series(plots, plot_dir),
+        plot_timeline(plots, plot_dir),
     ]:
         if out is not None:
             outputs.append(out)
@@ -676,26 +715,32 @@ def write_plots(out_prefix: str, astar_stats, rrt_stats, astar_bag: str, rrt_bag
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Compare A* and RRT* planner runs from ROS2 bags.")
+    parser = argparse.ArgumentParser(description="Compare global planner runs from ROS2 bags.")
     parser.add_argument("--astar-bag", required=True, help="A* rosbag directory or .db3 path")
     parser.add_argument("--rrt-bag", required=True, help="RRT* rosbag directory or .db3 path")
+    parser.add_argument("--prm-bag", default=None, help="Optional PRM rosbag directory or .db3 path")
     parser.add_argument("--astar-log", default=None, help="Optional A* terminal log/result.txt")
     parser.add_argument("--rrt-log", default=None, help="Optional RRT* terminal log/result.txt")
+    parser.add_argument("--prm-log", default=None, help="Optional PRM terminal log/result.txt")
     parser.add_argument("--out-prefix", default="planner_compare", help="Output prefix for CSV/Markdown")
     parser.add_argument("--no-plots", action="store_true", help="Skip PNG plot generation")
     args = parser.parse_args()
 
-    astar = analyze_bag("A*", args.astar_bag, args.astar_log)
-    rrt = analyze_bag("RRT*", args.rrt_bag, args.rrt_log)
+    planners = [
+        analyze_bag("A*", args.astar_bag, args.astar_log),
+        analyze_bag("RRT*", args.rrt_bag, args.rrt_log),
+    ]
+    if args.prm_bag:
+        planners.append(analyze_bag("PRM", args.prm_bag, args.prm_log))
 
-    print_table(astar, rrt)
-    csv_path = write_csv(args.out_prefix, astar, rrt)
-    md_path = write_markdown(args.out_prefix, astar, rrt)
+    print_table(planners)
+    csv_path = write_csv(args.out_prefix, planners)
+    md_path = write_markdown(args.out_prefix, planners)
     print(f"\nSaved: {csv_path}")
     print(f"Saved: {md_path}")
     if not args.no_plots:
         try:
-            plot_paths = write_plots(args.out_prefix, astar, rrt, args.astar_bag, args.rrt_bag)
+            plot_paths = write_plots(args.out_prefix, planners)
             for path in plot_paths:
                 print(f"Saved: {path}")
         except ImportError as exc:

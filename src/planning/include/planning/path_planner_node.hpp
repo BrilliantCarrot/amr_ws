@@ -26,6 +26,7 @@
 #include <amr_msgs/msg/obstacle_array.hpp>
 
 #include "planning/astar.hpp"
+#include "planning/prm.hpp"
 #include "planning/rrt_star.hpp"
 #include <amr_msgs/msg/localization_status.hpp>
 
@@ -173,8 +174,8 @@ private:
   int smoothing_los_safety_cells_{2};
   double path_viz_republish_period_sec_{1.0};
 
-  // Planner backend 선택 및 RRT* 파라미터.
-  // A*는 기존 deterministic grid planner, RRT*는 sampling-based planner 비교용으로 유지한다.
+  // Planner backend 선택 및 sampling-based planner 파라미터.
+  // A*는 deterministic grid planner, RRT*/PRM은 sampling-based planner 비교용으로 유지한다.
   std::string planner_type_{"astar"};
   int rrt_max_iterations_{3000};
   double rrt_step_size_{0.25};
@@ -183,6 +184,11 @@ private:
   double rrt_rewire_radius_{0.60};
   double rrt_collision_check_resolution_{0.05};
   int rrt_random_seed_{7};
+  int prm_num_samples_{1200};
+  int prm_k_neighbors_{12};
+  double prm_connection_radius_{1.00};
+  double prm_collision_check_resolution_{0.05};
+  int prm_random_seed_{11};
 
   double distanceToCurrentPath(double x, double y) const;
 
@@ -198,6 +204,7 @@ private:
   rclcpp::Time last_replan_attempt_time_;
 
   AStar astar_;
+  PRM prm_;
   RRTStar rrt_star_;
 };
 

@@ -17,6 +17,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 # ---------------------------------------------------------------
 add_executable(path_planner_node
   src/astar.cpp
+  src/prm.cpp
   src/rrt_star.cpp
   src/path_planner_node.cpp
   src/main.cpp
@@ -29,8 +30,20 @@ ament_target_dependencies(path_planner_node
   amr_msgs
 )
 
+add_executable(dwa_local_planner_node
+  src/dwa_local_planner_node.cpp
+)
+
+ament_target_dependencies(dwa_local_planner_node
+  rclcpp
+  nav_msgs
+  geometry_msgs
+  amr_msgs
+)
+
 install(TARGETS
   path_planner_node
+  dwa_local_planner_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
